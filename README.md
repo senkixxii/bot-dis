@@ -59,3 +59,13 @@ async def coin(self, interaction: discord.Interaction):
 ```
 
 ถ้าสร้างไฟล์ cog ใหม่ อย่าลืมเพิ่มชื่อใน `EXTENSIONS` ใน `bot.py`
+
+## รันฟรีตลอด 24 ชม. บน Render (ทำบนมือถือได้)
+
+1. สมัคร https://render.com ด้วยบัญชี GitHub
+2. กด **New → Blueprint** → เลือก repo นี้ (Render จะอ่าน `render.yaml` ให้เอง)
+3. ใส่ `DISCORD_TOKEN` (ส่วน `GUILD_ID`, `WELCOME_CHANNEL_ID` ใส่หรือเว้นไว้ก็ได้) → กด **Apply**
+4. รอ deploy เสร็จ จะได้ลิงก์ประมาณ `https://discord-bot-xxxx.onrender.com`
+5. สมัคร https://uptimerobot.com → **Add New Monitor** → แบบ HTTP(s) → ใส่ลิงก์จากข้อ 4 → ตั้งให้เช็กทุก 5 นาที
+
+ข้อ 5 สำคัญ: แพ็กเกจฟรีของ Render จะหลับเมื่อไม่มีใครเข้าเว็บ 15 นาที UptimeRobot จะคอยเรียกให้ตื่นตลอด

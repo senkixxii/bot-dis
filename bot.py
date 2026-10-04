@@ -2,6 +2,7 @@ import logging
 import os
 
 import discord
+from aiohttp import web
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -9,6 +10,7 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+PORT = os.getenv("PORT")  # โฮสต์อย่าง Render จะตั้งค่านี้ให้เอง
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("bot")
@@ -25,6 +27,9 @@ class Bot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        if PORT:
+            await self.start_web_server(int(PORT))
+
         for ext in EXTENSIONS:
             await self.load_extension(ext)
             log.info("โหลด %s แล้ว", ext)
@@ -38,6 +43,18 @@ class Bot(commands.Bot):
             # sync ทุกเซิร์ฟเวอร์: อาจใช้เวลาสักพักกว่าคำสั่งจะขึ้น
             synced = await self.tree.sync()
         log.info("sync slash command แล้ว %d คำสั่ง", len(synced))
+
+    async def start_web_server(self, port: int):
+        # เว็บเล็ก ๆ ไว้ให้ UptimeRobot เรียกทุก 5 นาที กันโฮสต์ฟรีสั่งหลับ
+        async def health(_request):
+            return web.Response(text="Bot is running")
+
+        app = web.Application()
+        app.router.add_get("/", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        log.info("เปิดเว็บ keep-alive ที่พอร์ต %d", port)
 
     async def on_ready(self):
         log.info("ล็อกอินเป็น %s (ID: %s)", self.user, self.user.id)
