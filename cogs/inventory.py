@@ -37,6 +37,27 @@ class OwnerView(discord.ui.View):
         return interaction.user.id == self.owner_id
 
 
+class ConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int):
+        super().__init__(timeout=60)
+        self.owner_id = owner_id
+        self.confirmed = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    @discord.ui.button(label="ยืนยัน", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.confirmed = True
+        await interaction.response.edit_message(content="กำลังดำเนินการ...", view=None)
+        self.stop()
+
+    @discord.ui.button(label="ยกเลิก", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await interaction.response.edit_message(content="ยกเลิกแล้ว", view=None)
+        self.stop()
+
+
 def fmt_item(item) -> str:
     return f"**{item['name']}** (ขนาด {item['size']}) — {item['description'] or 'ไม่มีคำอธิบาย'}"
 
@@ -192,6 +213,36 @@ class Inventory(commands.Cog):
             return
         await db.set_slot(self.pool, interaction.guild_id, key, label, capacity)
         await interaction.response.send_message(f"✅ ช่อง `{key}` = **{label}** ความจุ {capacity}", ephemeral=True)
+
+    @app_commands.command(name="slot-delete", description="[แอดมิน] ลบช่องเก็บของ (ต้องไม่มีใครถือของในช่องนั้น)")
+    @app_commands.autocomplete(key=slot_ac)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def slot_delete(self, interaction: discord.Interaction, key: str):
+        slot = await db.delete_slot(self.pool, interaction.guild_id, key.lower())
+        await interaction.response.send_message(f"🗑️ ลบช่อง **{slot['label']}** (`{slot['key']}`) แล้ว", ephemeral=True)
+
+    @app_commands.command(name="slot-reset", description="[แอดมิน] คืนช่องเก็บของเป็นชุดเริ่มต้น (มือซ้าย/ขวา กระเป๋ากางเกง กระเป๋าสะพาย)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def slot_reset(self, interaction: discord.Interaction):
+        view = ConfirmView(interaction.user.id)
+        await interaction.response.send_message(
+            "คืนช่องเป็นชุดเริ่มต้น? ช่องที่แอดมินเพิ่มเองจะถูกลบ และชื่อ/ความจุของช่องเริ่มต้นจะกลับเป็นค่าเดิม",
+            view=view,
+            ephemeral=True,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return
+        try:
+            removed = await db.reset_slots(self.pool, interaction.guild_id)
+            text = f"✅ คืนช่องเป็นชุดเริ่มต้นแล้ว (ลบช่องที่เพิ่มเอง {removed} ช่อง)"
+        except db.InventoryError as e:
+            text = str(e)
+        await interaction.edit_original_response(content=text, view=None)
 
     @app_commands.command(name="slot-list", description="ดูช่องเก็บของทั้งหมดและความจุ")
     @app_commands.guild_only()

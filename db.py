@@ -43,6 +43,58 @@ async def set_slot(pool, guild_id: int, key: str, label: str, capacity: int):
         )
 
 
+async def _remove_slots(conn, guild_id: int, keys: list[str]):
+    """ลบช่องตาม keys ถ้าไม่มีใครถืออยู่และไม่มีไอเท็มที่ใส่ได้เฉพาะช่องเหล่านี้"""
+    if not keys:
+        return
+    held = await conn.fetchval(
+        "select count(*) from inventory_entries where guild_id = $1 and slot_key = any($2::text[])", guild_id, keys
+    )
+    if held:
+        raise InventoryError(f"มีผู้เล่นถือของในช่องที่จะลบอยู่ {held} ชิ้น ให้ย้ายหรือทิ้งของก่อน")
+    stuck = await conn.fetch(
+        "select name from items where guild_id = $1 and allowed_slots <@ $2::text[] order by name", guild_id, keys
+    )
+    if stuck:
+        names = ", ".join(r["name"] for r in stuck[:10])
+        raise InventoryError(f"ไอเท็มเหล่านี้ใส่ได้เฉพาะช่องที่จะลบ แก้ด้วย /item-edit ก่อน: {names}")
+    await conn.execute(
+        """update items set allowed_slots = array(select k from unnest(allowed_slots) k where k <> all($2::text[]))
+           where guild_id = $1 and allowed_slots && $2::text[]""",
+        guild_id, keys,
+    )
+    await conn.execute("delete from slots where guild_id = $1 and key = any($2::text[])", guild_id, keys)
+
+
+async def delete_slot(pool, guild_id: int, key: str):
+    async with pool.acquire() as conn, conn.transaction():
+        await ensure_default_slots(conn, guild_id)
+        slot = await conn.fetchrow("select * from slots where guild_id = $1 and key = $2", guild_id, key)
+        if slot is None:
+            raise InventoryError(f"ไม่มีช่อง `{key}`")
+        if await conn.fetchval("select count(*) from slots where guild_id = $1", guild_id) <= 1:
+            raise InventoryError("ต้องเหลือช่องอย่างน้อย 1 ช่อง")
+        await _remove_slots(conn, guild_id, [key])
+        return slot
+
+
+async def reset_slots(pool, guild_id: int):
+    """คืนช่องเป็นชุดเริ่มต้น: ลบช่องที่เพิ่มเอง และตั้งชื่อ/ความจุของช่องเริ่มต้นกลับเป็นค่าเดิม"""
+    async with pool.acquire() as conn, conn.transaction():
+        await ensure_default_slots(conn, guild_id)
+        default_keys = [k for k, _, _ in DEFAULT_SLOTS]
+        extra = await conn.fetch(
+            "select key from slots where guild_id = $1 and key <> all($2::text[])", guild_id, default_keys
+        )
+        await _remove_slots(conn, guild_id, [r["key"] for r in extra])
+        await conn.executemany(
+            """insert into slots (guild_id, key, label, capacity) values ($1, $2, $3, $4)
+               on conflict (guild_id, key) do update set label = excluded.label, capacity = excluded.capacity""",
+            [(guild_id, k, label, cap) for k, label, cap in DEFAULT_SLOTS],
+        )
+        return len(extra)
+
+
 async def create_item(pool, guild_id: int, name: str, description: str, allowed_slots: list[str], size: int, created_by: int):
     async with pool.acquire() as conn:
         try:
