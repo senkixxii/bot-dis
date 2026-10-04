@@ -11,6 +11,8 @@ services:
         value: 3.12.7
       - key: DISCORD_TOKEN
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: GUILD_ID
         sync: false
       - key: WELCOME_CHANNEL_ID

@@ -6,10 +6,13 @@ from aiohttp import web
 from discord.ext import commands
 from dotenv import load_dotenv
 
+import db
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = os.getenv("PORT")  # โฮสต์อย่าง Render จะตั้งค่านี้ให้เอง
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -25,12 +28,25 @@ EXTENSIONS = ["cogs.general", "cogs.fun", "cogs.welcome"]
 class Bot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
+        self.pool = None
+
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+        await super().close()
 
     async def setup_hook(self):
         if PORT:
             await self.start_web_server(int(PORT))
 
-        for ext in EXTENSIONS:
+        extensions = list(EXTENSIONS)
+        if DATABASE_URL:
+            self.pool = await db.create_pool(DATABASE_URL)
+            extensions.append("cogs.inventory")
+        else:
+            log.warning("ไม่พบ DATABASE_URL — ปิดระบบกระเป๋า (cogs.inventory)")
+
+        for ext in extensions:
             await self.load_extension(ext)
             log.info("โหลด %s แล้ว", ext)
 
