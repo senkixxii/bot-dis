@@ -54,3 +54,22 @@ create table if not exists starter_granted (
 
 alter table starter_items   enable row level security;
 alter table starter_granted enable row level security;
+
+-- ตัวละคร: 1 คนต่อ 1 ตัวละครต่อเซิร์ฟเวอร์ (กระเป๋าผูกกับผู้เล่นเหมือนเดิม)
+create table if not exists characters (
+    guild_id   bigint      not null,
+    user_id    bigint      not null,
+    name       text        not null,
+    created_at timestamptz not null default now(),
+    primary key (guild_id, user_id)
+);
+create unique index if not exists characters_guild_name_uq on characters (guild_id, lower(name));
+
+-- ตั้งค่าต่อเซิร์ฟเวอร์ (ยศที่ให้ตอนสร้างตัวละคร)
+create table if not exists guild_settings (
+    guild_id       bigint primary key,
+    player_role_id bigint
+);
+
+alter table characters     enable row level security;
+alter table guild_settings enable row level security;

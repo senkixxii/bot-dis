@@ -254,6 +254,78 @@ class Inventory(commands.Cog):
             text = str(e)
         await interaction.edit_original_response(content=text, view=None)
 
+    # ---------- ตัวละคร / ยศ ----------
+    async def _role_problem(self, guild: discord.Guild, role: discord.Role) -> str | None:
+        """คืนข้อความปัญหาถ้าบอทให้ยศนี้ไม่ได้ ไม่มีปัญหาคืน None"""
+        me = guild.me
+        if role.is_default() or role.managed:
+            return "ยศนี้ให้ผ่านบอทไม่ได้ (เป็น @everyone หรือยศของบอท/ระบบ)"
+        if not me.guild_permissions.manage_roles:
+            return "บอทไม่มีสิทธิ์ **จัดการยศ** (Manage Roles) — เปิดที่ ตั้งค่าเซิร์ฟเวอร์ → ยศ → ยศของบอท"
+        if role >= me.top_role:
+            return f"ยศของบอทต้องอยู่ **สูงกว่า** {role.mention} ในลำดับยศ — ลากยศของบอทขึ้นไปไว้เหนือยศนี้"
+        return None
+
+    @app_commands.command(name="player-role", description="[แอดมิน] ตั้งยศที่ผู้เล่นจะได้ตอนสร้างตัวละคร (ไม่ใส่ = ปิดการให้ยศ)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def player_role(self, interaction: discord.Interaction, role: discord.Role | None = None):
+        if role is None:
+            await db.set_player_role(self.pool, interaction.guild_id, None)
+            await interaction.response.send_message("ปิดการให้ยศตอนสร้างตัวละครแล้ว", ephemeral=True)
+            return
+        problem = await self._role_problem(interaction.guild, role)
+        await db.set_player_role(self.pool, interaction.guild_id, role.id)
+        text = f"✅ ผู้เล่นจะได้ยศ {role.mention} ตอนสร้างตัวละคร"
+        if problem:
+            text += f"\n⚠️ แต่ตอนนี้ยังให้ไม่ได้: {problem}"
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @app_commands.command(name="character-create", description="สร้างตัวละครของคุณ (ได้ยศผู้เล่นและชุดเริ่มต้น)")
+    @app_commands.describe(name="ชื่อตัวละคร (2-32 ตัวอักษร)")
+    @app_commands.guild_only()
+    async def character_create(self, interaction: discord.Interaction, name: app_commands.Range[str, 2, 32]):
+        name = name.strip()
+        if len(name) < 2:
+            raise db.InventoryError("ชื่อตัวละครสั้นเกินไป")
+        granted, skipped = await db.create_character(self.pool, interaction.guild_id, interaction.user.id, name)
+        lines = [f"🧑 {interaction.user.mention} สร้างตัวละคร **{name}** แล้ว"]
+
+        role_id = await db.get_player_role(self.pool, interaction.guild_id)
+        role = interaction.guild.get_role(role_id) if role_id else None
+        if role:
+            problem = await self._role_problem(interaction.guild, role)
+            if problem is None:
+                try:
+                    await interaction.user.add_roles(role, reason=f"สร้างตัวละคร {name}")
+                    lines.append(f"🏷️ ได้รับยศ {role.mention}")
+                except discord.HTTPException:
+                    problem = "บอทให้ยศไม่สำเร็จ"
+            if problem:
+                lines.append(f"⚠️ ยังไม่ได้ยศ: {problem} (แจ้งแอดมิน)")
+        note = fmt_starter_note(granted, skipped)
+        if note:
+            lines.append(note)
+        await interaction.response.send_message("\n".join(lines), allowed_mentions=discord.AllowedMentions(roles=False))
+
+    @app_commands.command(name="character-delete", description="[แอดมิน] ลบตัวละครของผู้เล่น (ของในกระเป๋าหายหมด สร้างใหม่แล้วได้ชุดเริ่มต้นอีกครั้ง)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def character_delete(self, interaction: discord.Interaction, member: discord.Member):
+        name = await db.delete_character(self.pool, interaction.guild_id, member.id)
+        text = f"🗑️ ลบตัวละคร **{name}** ของ {member.mention} แล้ว (รวมของในกระเป๋า)"
+        role_id = await db.get_player_role(self.pool, interaction.guild_id)
+        role = interaction.guild.get_role(role_id) if role_id else None
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="ลบตัวละคร")
+                text += f"\nถอดยศ {role.mention} แล้ว"
+            except discord.HTTPException:
+                text += f"\n⚠️ ถอดยศ {role.mention} ไม่สำเร็จ (เช็กสิทธิ์/ลำดับยศของบอท)"
+        await interaction.response.send_message(text, ephemeral=True)
+
     # ---------- ชุดไอเท็มเริ่มต้น ----------
     @app_commands.command(name="starter-add", description="[แอดมิน] เพิ่มไอเท็มในชุดเริ่มต้นของผู้เล่นใหม่")
     @app_commands.describe(item="ไอเท็ม", slot="ช่องที่จะใส่ให้")
@@ -290,6 +362,7 @@ class Inventory(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @admin_only
     async def starter_give(self, interaction: discord.Interaction, member: discord.Member):
+        await db.require_character(self.pool, interaction.guild_id, member.id)
         granted, skipped = await db.grant_starter(self.pool, interaction.guild_id, member.id, force=True)
         if not granted and not skipped:
             await interaction.response.send_message("ยังไม่ได้ตั้งชุดเริ่มต้น เพิ่มด้วย `/starter-add` ก่อน", ephemeral=True)
@@ -345,10 +418,8 @@ class Inventory(commands.Cog):
     @app_commands.autocomplete(item=item_ac, slot=slot_ac)
     @app_commands.guild_only()
     async def pickup(self, interaction: discord.Interaction, item: str, slot: str | None = None):
-        note = fmt_starter_note(*await db.grant_starter(self.pool, interaction.guild_id, interaction.user.id))
+        await db.require_character(self.pool, interaction.guild_id, interaction.user.id)
         await self._place_flow(interaction, interaction.user, item, slot, announce="🎒 {user} เก็บ **{item}** ใส่ **{slot}**")
-        if note:
-            await interaction.followup.send(note, ephemeral=True)
 
     @app_commands.command(name="give", description="[แอดมิน] แจกไอเท็มให้ผู้เล่น")
     @app_commands.autocomplete(item=item_ac, slot=slot_ac)
@@ -356,6 +427,7 @@ class Inventory(commands.Cog):
     @app_commands.default_permissions(manage_guild=True)
     @admin_only
     async def give(self, interaction: discord.Interaction, member: discord.Member, item: str, slot: str | None = None):
+        await db.require_character(self.pool, interaction.guild_id, member.id)
         await self._place_flow(interaction, member, item, slot, announce="🎁 {user} ได้รับ **{item}** ใส่ **{slot}**")
 
     # ---------- กระเป๋า ----------
@@ -365,11 +437,9 @@ class Inventory(commands.Cog):
         target = member or interaction.user
         if target.id != interaction.user.id and not interaction.permissions.manage_guild:
             raise app_commands.MissingPermissions(["manage_guild"])
-        note = None
-        if target.id == interaction.user.id:
-            note = fmt_starter_note(*await db.grant_starter(self.pool, interaction.guild_id, target.id))
+        char = await db.require_character(self.pool, interaction.guild_id, target.id)
         slots, entries = await db.inventory(self.pool, interaction.guild_id, target.id)
-        embed = discord.Embed(title=f"🎒 กระเป๋าของ {target.display_name}", color=discord.Color.gold())
+        embed = discord.Embed(title=f"🎒 กระเป๋าของ {char['name']}", color=discord.Color.gold())
         for s in slots:
             held = [e for e in entries if e["slot_key"] == s["key"]]
             used = sum(e["size"] for e in held)
@@ -379,13 +449,12 @@ class Inventory(commands.Cog):
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=target.id == interaction.user.id)
-        if note:
-            await interaction.followup.send(note, ephemeral=True)
 
     @app_commands.command(name="move", description="ย้ายไอเท็มไปช่องอื่น")
     @app_commands.autocomplete(item=held_ac, to_slot=slot_ac)
     @app_commands.guild_only()
     async def move(self, interaction: discord.Interaction, item: str, to_slot: str):
+        await db.require_character(self.pool, interaction.guild_id, interaction.user.id)
         it, slot = await db.move(self.pool, interaction.guild_id, interaction.user.id, item, to_slot)
         await interaction.response.send_message(f"🔄 ย้าย **{it['name']}** ไป **{slot['label']}**", ephemeral=True)
 
@@ -393,6 +462,7 @@ class Inventory(commands.Cog):
     @app_commands.autocomplete(item=held_ac, slot=slot_ac)
     @app_commands.guild_only()
     async def drop(self, interaction: discord.Interaction, item: str, slot: str | None = None):
+        await db.require_character(self.pool, interaction.guild_id, interaction.user.id)
         it = await db.drop(self.pool, interaction.guild_id, interaction.user.id, item, slot)
         await interaction.response.send_message(f"⬇️ {interaction.user.mention} ทิ้ง **{it['name']}**")
 

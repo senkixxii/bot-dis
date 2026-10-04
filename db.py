@@ -310,34 +310,97 @@ async def remove_starter(pool, guild_id: int, item_name: str, slot_key: str | No
         return row["name"]
 
 
+async def _grant_starter(conn, guild_id: int, user_id: int, force: bool):
+    first_time = await conn.fetchval(
+        "insert into starter_granted (guild_id, user_id) values ($1, $2) on conflict do nothing returning true",
+        guild_id, user_id,
+    )
+    if not first_time and not force:
+        return [], []
+    rows = await conn.fetch(
+        """select i.id, i.name, i.allowed_slots, i.size, s.slot_key from starter_items s
+           join items i on i.id = s.item_id where s.guild_id = $1 order by s.id""",
+        guild_id,
+    )
+    granted, skipped = [], []
+    for r in rows:
+        try:
+            slot = await _check_fit(conn, guild_id, user_id, r, r["slot_key"])
+        except InventoryError as e:
+            skipped.append(str(e))
+            continue
+        await conn.execute(
+            "insert into inventory_entries (guild_id, user_id, item_id, slot_key) values ($1, $2, $3, $4)",
+            guild_id, user_id, r["id"], r["slot_key"],
+        )
+        granted.append((r["name"], slot["label"]))
+    return granted, skipped
+
+
 async def grant_starter(pool, guild_id: int, user_id: int, force: bool = False):
     """แจกชุดเริ่มต้นให้ผู้เล่น
-    force=False (อัตโนมัติ): แจกครั้งเดียวต่อคน ถ้าเคยได้แล้วคืนค่าว่าง
+    force=False: แจกครั้งเดียวต่อคน ถ้าเคยได้แล้วคืนค่าว่าง
     force=True (แอดมินสั่ง): แจกเสมอ
     คืน (รายการที่ได้ [(ชื่อไอเท็ม, ชื่อช่อง)], ข้อความที่ใส่ไม่ได้ [str])"""
     async with pool.acquire() as conn, conn.transaction():
         await _lock_owner(conn, guild_id, user_id)
-        first_time = await conn.fetchval(
-            "insert into starter_granted (guild_id, user_id) values ($1, $2) on conflict do nothing returning true",
-            guild_id, user_id,
+        return await _grant_starter(conn, guild_id, user_id, force)
+
+
+# ---------- ตัวละคร ----------
+async def get_character(pool, guild_id: int, user_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, user_id)
+
+
+async def require_character(pool, guild_id: int, user_id: int):
+    char = await get_character(pool, guild_id, user_id)
+    if char is None:
+        raise InventoryError("ต้องสร้างตัวละครก่อน ใช้ `/character-create`")
+    return char
+
+
+async def create_character(pool, guild_id: int, user_id: int, name: str):
+    """สร้างตัวละคร + แจกชุดเริ่มต้น (ครั้งเดียวต่อคน) ใน transaction เดียว"""
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_owner(conn, guild_id, user_id)
+        existing = await conn.fetchval(
+            "select name from characters where guild_id = $1 and user_id = $2", guild_id, user_id
         )
-        if not first_time and not force:
-            return [], []
-        rows = await conn.fetch(
-            """select i.id, i.name, i.allowed_slots, i.size, s.slot_key from starter_items s
-               join items i on i.id = s.item_id where s.guild_id = $1 order by s.id""",
-            guild_id,
-        )
-        granted, skipped = [], []
-        for r in rows:
-            try:
-                slot = await _check_fit(conn, guild_id, user_id, r, r["slot_key"])
-            except InventoryError as e:
-                skipped.append(str(e))
-                continue
+        if existing:
+            raise InventoryError(f"คุณมีตัวละครแล้ว: **{existing}**")
+        try:
             await conn.execute(
-                "insert into inventory_entries (guild_id, user_id, item_id, slot_key) values ($1, $2, $3, $4)",
-                guild_id, user_id, r["id"], r["slot_key"],
+                "insert into characters (guild_id, user_id, name) values ($1, $2, $3)", guild_id, user_id, name
             )
-            granted.append((r["name"], slot["label"]))
-        return granted, skipped
+        except asyncpg.UniqueViolationError:
+            raise InventoryError(f"มีตัวละครชื่อ **{name}** อยู่แล้ว") from None
+        return await _grant_starter(conn, guild_id, user_id, force=False)
+
+
+async def delete_character(pool, guild_id: int, user_id: int):
+    """ลบตัวละคร + ของในกระเป๋าทั้งหมด + สถานะรับชุดเริ่มต้น (สร้างใหม่แล้วจะได้ชุดเริ่มต้นอีกครั้ง)"""
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_owner(conn, guild_id, user_id)
+        name = await conn.fetchval(
+            "delete from characters where guild_id = $1 and user_id = $2 returning name", guild_id, user_id
+        )
+        if name is None:
+            raise InventoryError("ผู้เล่นคนนี้ยังไม่มีตัวละคร")
+        await conn.execute("delete from inventory_entries where guild_id = $1 and user_id = $2", guild_id, user_id)
+        await conn.execute("delete from starter_granted where guild_id = $1 and user_id = $2", guild_id, user_id)
+        return name
+
+
+async def get_player_role(pool, guild_id: int) -> int | None:
+    async with pool.acquire() as conn:
+        return await conn.fetchval("select player_role_id from guild_settings where guild_id = $1", guild_id)
+
+
+async def set_player_role(pool, guild_id: int, role_id: int | None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """insert into guild_settings (guild_id, player_role_id) values ($1, $2)
+               on conflict (guild_id) do update set player_role_id = excluded.player_role_id""",
+            guild_id, role_id,
+        )
