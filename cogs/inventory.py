@@ -58,6 +58,16 @@ class ConfirmView(discord.ui.View):
         self.stop()
 
 
+def fmt_starter_note(granted, skipped) -> str | None:
+    if not granted and not skipped:
+        return None
+    lines = []
+    if granted:
+        lines.append("🎁 ได้รับชุดเริ่มต้น: " + ", ".join(f"{name} → {label}" for name, label in granted))
+    lines += [f"⚠️ {msg}" for msg in skipped]
+    return "\n".join(lines)
+
+
 def fmt_item(item) -> str:
     return f"**{item['name']}** (ขนาด {item['size']}) — {item['description'] or 'ไม่มีคำอธิบาย'}"
 
@@ -244,6 +254,49 @@ class Inventory(commands.Cog):
             text = str(e)
         await interaction.edit_original_response(content=text, view=None)
 
+    # ---------- ชุดไอเท็มเริ่มต้น ----------
+    @app_commands.command(name="starter-add", description="[แอดมิน] เพิ่มไอเท็มในชุดเริ่มต้นของผู้เล่นใหม่")
+    @app_commands.describe(item="ไอเท็ม", slot="ช่องที่จะใส่ให้")
+    @app_commands.autocomplete(item=item_ac, slot=slot_ac)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def starter_add(self, interaction: discord.Interaction, item: str, slot: str):
+        it, s = await db.add_starter(self.pool, interaction.guild_id, item, slot)
+        await interaction.response.send_message(f"✅ ชุดเริ่มต้น: เพิ่ม **{it['name']}** ใส่ **{s['label']}**", ephemeral=True)
+
+    @app_commands.command(name="starter-remove", description="[แอดมิน] เอาไอเท็มออกจากชุดเริ่มต้น")
+    @app_commands.autocomplete(item=item_ac, slot=slot_ac)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def starter_remove(self, interaction: discord.Interaction, item: str, slot: str | None = None):
+        name = await db.remove_starter(self.pool, interaction.guild_id, item, slot)
+        await interaction.response.send_message(f"🗑️ เอา **{name}** ออกจากชุดเริ่มต้นแล้ว", ephemeral=True)
+
+    @app_commands.command(name="starter-list", description="ดูชุดไอเท็มเริ่มต้นของผู้เล่นใหม่")
+    @app_commands.guild_only()
+    async def starter_list(self, interaction: discord.Interaction):
+        rows = await db.list_starters(self.pool, interaction.guild_id)
+        if not rows:
+            await interaction.response.send_message("ยังไม่ได้ตั้งชุดเริ่มต้น แอดมินเพิ่มได้ด้วย `/starter-add`", ephemeral=True)
+            return
+        slots = {s["key"]: s["label"] for s in await db.list_slots(self.pool, interaction.guild_id)}
+        lines = [f"• {r['name']} → {slots.get(r['slot_key'], r['slot_key'])}" for r in rows]
+        await interaction.response.send_message("🎒 ชุดเริ่มต้น\n" + "\n".join(lines), ephemeral=True)
+
+    @app_commands.command(name="starter-give", description="[แอดมิน] แจกชุดเริ่มต้นให้ผู้เล่น (แจกซ้ำได้ ของอาจซ้ำกับที่มีอยู่)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def starter_give(self, interaction: discord.Interaction, member: discord.Member):
+        granted, skipped = await db.grant_starter(self.pool, interaction.guild_id, member.id, force=True)
+        if not granted and not skipped:
+            await interaction.response.send_message("ยังไม่ได้ตั้งชุดเริ่มต้น เพิ่มด้วย `/starter-add` ก่อน", ephemeral=True)
+            return
+        text = f"🎁 แจกชุดเริ่มต้นให้ {member.mention}\n" + (fmt_starter_note(granted, skipped) or "")
+        await interaction.response.send_message(text)
+
     @app_commands.command(name="slot-list", description="ดูช่องเก็บของทั้งหมดและความจุ")
     @app_commands.guild_only()
     async def slot_list(self, interaction: discord.Interaction):
@@ -292,7 +345,10 @@ class Inventory(commands.Cog):
     @app_commands.autocomplete(item=item_ac, slot=slot_ac)
     @app_commands.guild_only()
     async def pickup(self, interaction: discord.Interaction, item: str, slot: str | None = None):
+        note = fmt_starter_note(*await db.grant_starter(self.pool, interaction.guild_id, interaction.user.id))
         await self._place_flow(interaction, interaction.user, item, slot, announce="🎒 {user} เก็บ **{item}** ใส่ **{slot}**")
+        if note:
+            await interaction.followup.send(note, ephemeral=True)
 
     @app_commands.command(name="give", description="[แอดมิน] แจกไอเท็มให้ผู้เล่น")
     @app_commands.autocomplete(item=item_ac, slot=slot_ac)
@@ -309,6 +365,9 @@ class Inventory(commands.Cog):
         target = member or interaction.user
         if target.id != interaction.user.id and not interaction.permissions.manage_guild:
             raise app_commands.MissingPermissions(["manage_guild"])
+        note = None
+        if target.id == interaction.user.id:
+            note = fmt_starter_note(*await db.grant_starter(self.pool, interaction.guild_id, target.id))
         slots, entries = await db.inventory(self.pool, interaction.guild_id, target.id)
         embed = discord.Embed(title=f"🎒 กระเป๋าของ {target.display_name}", color=discord.Color.gold())
         for s in slots:
@@ -320,6 +379,8 @@ class Inventory(commands.Cog):
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=target.id == interaction.user.id)
+        if note:
+            await interaction.followup.send(note, ephemeral=True)
 
     @app_commands.command(name="move", description="ย้ายไอเท็มไปช่องอื่น")
     @app_commands.autocomplete(item=held_ac, to_slot=slot_ac)

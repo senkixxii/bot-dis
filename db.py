@@ -1,4 +1,8 @@
+from pathlib import Path
+
 import asyncpg
+
+SCHEMA_FILE = Path(__file__).parent / "sql" / "inventory.sql"
 
 DEFAULT_SLOTS = [
     ("left_hand", "มือซ้าย", 1),
@@ -15,6 +19,12 @@ class InventoryError(Exception):
 async def create_pool(dsn: str) -> asyncpg.Pool:
     # statement_cache_size=0 เพื่อให้ใช้ได้กับ pooler แบบ transaction ของ Supabase
     return await asyncpg.create_pool(dsn, min_size=1, max_size=5, statement_cache_size=0)
+
+
+async def init_schema(pool: asyncpg.Pool):
+    """สร้าง/อัปเดตตารางตาม sql/inventory.sql (รันซ้ำได้ ไม่ทับข้อมูลเดิม)"""
+    async with pool.acquire() as conn:
+        await conn.execute(SCHEMA_FILE.read_text(encoding="utf-8"))
 
 
 async def ensure_default_slots(conn, guild_id: int):
@@ -63,6 +73,7 @@ async def _remove_slots(conn, guild_id: int, keys: list[str]):
            where guild_id = $1 and allowed_slots && $2::text[]""",
         guild_id, keys,
     )
+    await conn.execute("delete from starter_items where guild_id = $1 and slot_key = any($2::text[])", guild_id, keys)
     await conn.execute("delete from slots where guild_id = $1 and key = any($2::text[])", guild_id, keys)
 
 
@@ -249,3 +260,84 @@ async def inventory(pool, guild_id: int, user_id: int):
             guild_id, user_id,
         )
     return slots, entries
+
+
+# ---------- ชุดไอเท็มเริ่มต้น ----------
+async def add_starter(pool, guild_id: int, item_name: str, slot_key: str):
+    async with pool.acquire() as conn, conn.transaction():
+        await ensure_default_slots(conn, guild_id)
+        item = await get_item(conn, guild_id, item_name)
+        slot = await conn.fetchrow("select * from slots where guild_id = $1 and key = $2", guild_id, slot_key)
+        if slot is None:
+            raise InventoryError(f"ไม่มีช่อง `{slot_key}`")
+        if slot_key not in item["allowed_slots"]:
+            raise InventoryError(f"**{item['name']}** ใส่ช่อง **{slot['label']}** ไม่ได้")
+        used = await conn.fetchval(
+            """select coalesce(sum(i.size), 0) from starter_items s join items i on i.id = s.item_id
+               where s.guild_id = $1 and s.slot_key = $2""",
+            guild_id, slot_key,
+        )
+        if used + item["size"] > slot["capacity"]:
+            raise InventoryError(
+                f"ชุดเริ่มต้นในช่อง **{slot['label']}** จะเกินความจุ (ใช้ {used}/{slot['capacity']}, **{item['name']}** ต้องการ {item['size']})"
+            )
+        await conn.execute(
+            "insert into starter_items (guild_id, item_id, slot_key) values ($1, $2, $3)", guild_id, item["id"], slot_key
+        )
+        return item, slot
+
+
+async def list_starters(pool, guild_id: int):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """select s.id, s.slot_key, i.name, i.size from starter_items s join items i on i.id = s.item_id
+               where s.guild_id = $1 order by s.id""",
+            guild_id,
+        )
+
+
+async def remove_starter(pool, guild_id: int, item_name: str, slot_key: str | None = None):
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(
+            """select s.id, i.name from starter_items s join items i on i.id = s.item_id
+               where s.guild_id = $1 and lower(i.name) = lower($2) and ($3::text is null or s.slot_key = $3)
+               order by s.id desc limit 1""",
+            guild_id, item_name, slot_key,
+        )
+        if row is None:
+            raise InventoryError(f"ไม่มี **{item_name}** ในชุดเริ่มต้น")
+        await conn.execute("delete from starter_items where id = $1", row["id"])
+        return row["name"]
+
+
+async def grant_starter(pool, guild_id: int, user_id: int, force: bool = False):
+    """แจกชุดเริ่มต้นให้ผู้เล่น
+    force=False (อัตโนมัติ): แจกครั้งเดียวต่อคน ถ้าเคยได้แล้วคืนค่าว่าง
+    force=True (แอดมินสั่ง): แจกเสมอ
+    คืน (รายการที่ได้ [(ชื่อไอเท็ม, ชื่อช่อง)], ข้อความที่ใส่ไม่ได้ [str])"""
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_owner(conn, guild_id, user_id)
+        first_time = await conn.fetchval(
+            "insert into starter_granted (guild_id, user_id) values ($1, $2) on conflict do nothing returning true",
+            guild_id, user_id,
+        )
+        if not first_time and not force:
+            return [], []
+        rows = await conn.fetch(
+            """select i.id, i.name, i.allowed_slots, i.size, s.slot_key from starter_items s
+               join items i on i.id = s.item_id where s.guild_id = $1 order by s.id""",
+            guild_id,
+        )
+        granted, skipped = [], []
+        for r in rows:
+            try:
+                slot = await _check_fit(conn, guild_id, user_id, r, r["slot_key"])
+            except InventoryError as e:
+                skipped.append(str(e))
+                continue
+            await conn.execute(
+                "insert into inventory_entries (guild_id, user_id, item_id, slot_key) values ($1, $2, $3, $4)",
+                guild_id, user_id, r["id"], r["slot_key"],
+            )
+            granted.append((r["name"], slot["label"]))
+        return granted, skipped

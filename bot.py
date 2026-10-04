@@ -42,6 +42,7 @@ class Bot(commands.Bot):
         extensions = list(EXTENSIONS)
         if DATABASE_URL:
             self.pool = await db.create_pool(DATABASE_URL)
+            await db.init_schema(self.pool)
             extensions.append("cogs.inventory")
         else:
             log.warning("ไม่พบ DATABASE_URL — ปิดระบบกระเป๋า (cogs.inventory)")

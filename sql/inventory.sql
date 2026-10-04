@@ -34,3 +34,23 @@ create index if not exists inventory_entries_owner_idx on inventory_entries (gui
 alter table slots             enable row level security;
 alter table items             enable row level security;
 alter table inventory_entries enable row level security;
+
+-- ชุดไอเท็มเริ่มต้น: แต่ละแถว = 1 ชิ้นที่ผู้เล่นจะได้ในช่องนั้น
+create table if not exists starter_items (
+    id       bigserial primary key,
+    guild_id bigint not null,
+    item_id  bigint not null references items (id) on delete cascade,
+    slot_key text   not null
+);
+create index if not exists starter_items_guild_idx on starter_items (guild_id);
+
+-- บันทึกว่าผู้เล่นคนไหนได้รับชุดเริ่มต้นอัตโนมัติไปแล้ว (ได้ครั้งเดียว)
+create table if not exists starter_granted (
+    guild_id   bigint      not null,
+    user_id    bigint      not null,
+    granted_at timestamptz not null default now(),
+    primary key (guild_id, user_id)
+);
+
+alter table starter_items   enable row level security;
+alter table starter_granted enable row level security;
