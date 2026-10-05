@@ -6,12 +6,13 @@ from discord.ext import commands
 # (ชื่อหมวด, คำสั่งในหมวด, เฉพาะแอดมิน) — คำสั่งใหม่ให้เพิ่มชื่อที่นี่
 HELP_CATEGORIES = [
     ("🧑 ตัวละคร", ["character-create"], False),
+    ("⚔️ ต่อสู้", ["attack", "reload", "hp"], False),
     ("🎒 กระเป๋า", ["inventory", "pickup", "move", "drop", "item-list", "slot-list", "starter-list"], False),
     ("🎮 ทั่วไป", ["help", "ping", "hello", "userinfo", "choose"], False),
-    ("🛡️ แอดมิน: ไอเท็มและช่อง", ["item-create", "item-edit", "item-delete", "slot-set", "slot-delete", "slot-reset"], True),
+    ("🛡️ แอดมิน: ไอเท็มและช่อง", ["item-create", "item-edit", "item-weapon", "item-delete", "slot-set", "slot-delete", "slot-reset"], True),
     (
         "🛡️ แอดมิน: ผู้เล่นและชุดเริ่มต้น",
-        ["give", "character-delete", "player-role", "starter-add", "starter-remove", "starter-give"],
+        ["give", "character-delete", "player-role", "hp-set", "hp-default", "starter-add", "starter-remove", "starter-give"],
         True,
     ),
 ]

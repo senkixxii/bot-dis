@@ -37,6 +37,20 @@ class OwnerView(discord.ui.View):
         return interaction.user.id == self.owner_id
 
 
+def attack_slots_view(owner_id: int, slots, allowed_keys, on_done) -> discord.ui.View:
+    """เมนูเลือกช่องที่ต้องถืออาวุธเพื่อโจมตี + ปุ่ม "ไม่จำกัดช่อง" (on_done(interaction, keys) keys ว่าง = ไม่จำกัด)"""
+    options = [s for s in slots if s["key"] in allowed_keys]
+    view = OwnerView(owner_id, SlotSelect(options, on_done, multi=True, placeholder="ช่องที่ต้องถืออาวุธเพื่อโจมตี"))
+    button = discord.ui.Button(label="ไม่จำกัดช่อง (ช่องไหนก็โจมตีได้)", style=discord.ButtonStyle.secondary)
+
+    async def free(interaction: discord.Interaction):
+        await on_done(interaction, [])
+
+    button.callback = free
+    view.add_item(button)
+    return view
+
+
 class ConfirmView(discord.ui.View):
     def __init__(self, owner_id: int):
         super().__init__(timeout=60)
@@ -66,6 +80,19 @@ def fmt_starter_note(granted, skipped) -> str | None:
         lines.append("🎁 ได้รับชุดเริ่มต้น: " + ", ".join(f"{name} → {label}" for name, label in granted))
     lines += [f"⚠️ {msg}" for msg in skipped]
     return "\n".join(lines)
+
+
+def fmt_weapon(item, ammo_name: str | None = None, labels: dict | None = None) -> str | None:
+    """บรรทัดสรุปคุณสมบัติอาวุธ (ไม่ใช่อาวุธ = None)"""
+    if item["damage_min"] is None:
+        return None
+    dmg = str(item["damage_min"]) if item["damage_min"] == item["damage_max"] else f"{item['damage_min']}-{item['damage_max']}"
+    parts = [f"⚔️ ดาเมจ {dmg}"]
+    if item["ammo_item_id"] is not None:
+        parts.append(f"กระสุน: {ammo_name or '?'} (แม็ก {item['mag_size']}, ใช้ {item['ammo_per_attack']} นัด/ครั้ง)")
+    if item["attack_slots"]:
+        parts.append("ถือที่: " + ", ".join((labels or {}).get(k, k) for k in item["attack_slots"]))
+    return " · ".join(parts)
 
 
 def fmt_item(item) -> str:
@@ -113,8 +140,18 @@ class Inventory(commands.Cog):
         return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
 
     # ---------- แอดมิน: จัดการไอเท็ม ----------
-    @app_commands.command(name="item-create", description="[แอดมิน] สร้างไอเท็มใหม่ แล้วเลือกช่องที่ใส่ได้")
-    @app_commands.describe(name="ชื่อไอเท็ม เช่น ปืน", size="ขนาด/พื้นที่ที่กินในช่อง (ค่าเริ่มต้น 1)", description="คำอธิบาย")
+    @app_commands.command(name="item-create", description="[แอดมิน] สร้างไอเท็มใหม่ (ใส่ damage = เป็นอาวุธ)")
+    @app_commands.describe(
+        name="ชื่อไอเท็ม เช่น ปืน",
+        size="ขนาด/พื้นที่ที่กินในช่อง (ค่าเริ่มต้น 1)",
+        description="คำอธิบาย",
+        damage="ดาเมจ (ต่ำสุด) — ไม่ใส่ = โจมตีไม่ได้",
+        damage_max="ดาเมจสูงสุด (ไม่ใส่ = เท่าต่ำสุด)",
+        ammo_item="ไอเท็มที่ใช้เป็นกระสุน (ไม่ใส่ = ไม่ต้องใช้กระสุน โจมตีได้เลย)",
+        mag_size="แม็กจุกระสุนกี่นัด (ต้องใส่เมื่อมี ammo_item)",
+        ammo_per_attack="ใช้กระสุนกี่นัดต่อการโจมตี (ค่าเริ่มต้น 1)",
+    )
+    @app_commands.autocomplete(ammo_item=item_ac)
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     @admin_only
@@ -124,20 +161,95 @@ class Inventory(commands.Cog):
         name: app_commands.Range[str, 1, 60],
         size: app_commands.Range[int, 1, 100] = 1,
         description: app_commands.Range[str, 0, 300] = "",
+        damage: app_commands.Range[int, 0, 100000] | None = None,
+        damage_max: app_commands.Range[int, 0, 100000] | None = None,
+        ammo_item: str | None = None,
+        mag_size: app_commands.Range[int, 1, 1000] | None = None,
+        ammo_per_attack: app_commands.Range[int, 1, 1000] | None = None,
     ):
+        weapon = None
+        if damage is not None:
+            weapon = dict(damage=damage, damage_max=damage_max, ammo_item=ammo_item, mag_size=mag_size, ammo_per_attack=ammo_per_attack)
+            await db.check_weapon_args(self.pool, interaction.guild_id, weapon)  # เช็กล่วงหน้า ก่อนให้เลือกช่อง
+        elif any(v is not None for v in (damage_max, ammo_item, mag_size, ammo_per_attack)):
+            raise db.InventoryError("ต้องใส่ damage ด้วย ถึงจะตั้งเป็นอาวุธได้")
         slots = await db.list_slots(self.pool, interaction.guild_id)
+        labels = {s["key"]: s["label"] for s in slots}
 
-        async def on_pick(i: discord.Interaction, keys: list[str]):
+        async def finish(i: discord.Interaction, allowed: list[str], attack_slots: list[str] | None):
             try:
-                item = await db.create_item(self.pool, i.guild_id, name, description, keys, size, i.user.id)
+                w = {**weapon, "attack_slots": attack_slots} if weapon else None
+                item = await db.create_item(self.pool, i.guild_id, name, description, allowed, size, i.user.id, weapon=w)
             except db.InventoryError as e:
                 await i.response.edit_message(content=str(e), view=None)
                 return
-            labels = ", ".join(s["label"] for s in slots if s["key"] in keys)
-            await i.response.edit_message(content=f"✅ สร้าง {fmt_item(item)}\nใส่ได้ที่: {labels}", view=None)
+            text = f"✅ สร้าง {fmt_item(item)}\nใส่ได้ที่: {', '.join(labels.get(k, k) for k in allowed)}"
+            if weapon:
+                text += "\n" + fmt_weapon(item, ammo_item, labels)
+            await i.response.edit_message(content=text, view=None)
+
+        async def on_pick(i: discord.Interaction, keys: list[str]):
+            if weapon is None:
+                await finish(i, keys, None)
+                return
+
+            async def on_attack_slots(i2: discord.Interaction, attack_keys: list[str]):
+                await finish(i2, keys, attack_keys)
+
+            view = attack_slots_view(i.user.id, slots, keys, on_attack_slots)
+            await i.response.edit_message(content=f"**{name}** — ต้องถือในช่องไหนถึงจะโจมตีได้?", view=view)
 
         view = OwnerView(interaction.user.id, SlotSelect(slots, on_pick, multi=True, placeholder="เลือกช่องที่ไอเท็มนี้ใส่ได้"))
         await interaction.response.send_message(f"สร้าง **{name}** — เลือกช่องที่ใส่ได้:", view=view, ephemeral=True)
+
+    @app_commands.command(name="item-weapon", description="[แอดมิน] ตั้ง/แก้/ลบดาเมจและเงื่อนไขกระสุนของไอเท็ม")
+    @app_commands.describe(
+        item="ไอเท็มที่จะตั้ง",
+        damage="ดาเมจ (ต่ำสุด)",
+        damage_max="ดาเมจสูงสุด (ไม่ใส่ = เท่าต่ำสุด)",
+        ammo_item="ไอเท็มที่ใช้เป็นกระสุน (ไม่ใส่ = ไม่ต้องใช้กระสุน)",
+        mag_size="แม็กจุกระสุนกี่นัด (ต้องใส่เมื่อมี ammo_item)",
+        ammo_per_attack="ใช้กระสุนกี่นัดต่อการโจมตี (ค่าเริ่มต้น 1)",
+        clear="True = ลบคุณสมบัติอาวุธ (ไอเท็มจะโจมตีไม่ได้)",
+    )
+    @app_commands.autocomplete(item=item_ac, ammo_item=item_ac)
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def item_weapon(
+        self,
+        interaction: discord.Interaction,
+        item: str,
+        damage: app_commands.Range[int, 0, 100000] | None = None,
+        damage_max: app_commands.Range[int, 0, 100000] | None = None,
+        ammo_item: str | None = None,
+        mag_size: app_commands.Range[int, 1, 1000] | None = None,
+        ammo_per_attack: app_commands.Range[int, 1, 1000] | None = None,
+        clear: bool = False,
+    ):
+        gid = interaction.guild_id
+        if clear:
+            it = await db.clear_weapon(self.pool, gid, item)
+            await interaction.response.send_message(f"✅ **{it['name']}** ไม่ใช่อาวุธแล้ว (กระสุนที่บรรจุอยู่ถูกล้าง)", ephemeral=True)
+            return
+        if damage is None:
+            raise db.InventoryError("ใส่ damage เพื่อตั้งเป็นอาวุธ หรือใส่ clear:True เพื่อลบ")
+        target = await db.find_item(self.pool, gid, item)
+        weapon = dict(damage=damage, damage_max=damage_max, ammo_item=ammo_item, mag_size=mag_size, ammo_per_attack=ammo_per_attack)
+        await db.check_weapon_args(self.pool, gid, weapon, target["allowed_slots"])
+        slots = await db.list_slots(self.pool, gid)
+        labels = {s["key"]: s["label"] for s in slots}
+
+        async def on_done(i: discord.Interaction, attack_keys: list[str]):
+            try:
+                row = await db.set_weapon(self.pool, gid, item, {**weapon, "attack_slots": attack_keys})
+            except db.InventoryError as e:
+                await i.response.edit_message(content=str(e), view=None)
+                return
+            await i.response.edit_message(content=f"✅ **{row['name']}**\n{fmt_weapon(row, ammo_item, labels)}", view=None)
+
+        view = attack_slots_view(interaction.user.id, slots, target["allowed_slots"], on_done)
+        await interaction.response.send_message(f"**{target['name']}** — ต้องถือในช่องไหนถึงจะโจมตีได้?", view=view, ephemeral=True)
 
     @app_commands.command(name="item-edit", description="[แอดมิน] แก้ไอเท็ม (ใส่เฉพาะช่องที่อยากเปลี่ยน)")
     @app_commands.describe(name="ไอเท็มที่จะแก้", new_name="ชื่อใหม่", description="คำอธิบายใหม่", size="ขนาดใหม่", edit_slots="True = เลือกช่องที่ใส่ได้ใหม่")
@@ -196,12 +308,14 @@ class Inventory(commands.Cog):
             await interaction.response.send_message("ยังไม่มีไอเท็ม แอดมินสร้างได้ด้วย `/item-create`", ephemeral=True)
             return
         embed = discord.Embed(title="📦 ไอเท็มทั้งหมด", color=discord.Color.blurple())
+        labels = {s["key"]: s["label"] for s in await db.list_slots(self.pool, interaction.guild_id)}
         for item in items[:25]:
-            embed.add_field(
-                name=f"{item['name']} (ขนาด {item['size']})",
-                value=f"{item['description'] or '-'}\nใส่ได้: {', '.join(item['allowed_slots'])}",
-                inline=False,
-            )
+            allowed = ", ".join(labels.get(k, k) for k in item["allowed_slots"])
+            lines = [item["description"] or "-", f"ใส่ได้: {allowed}"]
+            weapon = fmt_weapon(item, item["ammo_name"], labels)
+            if weapon:
+                lines.append(weapon)
+            embed.add_field(name=f"{item['name']} (ขนาด {item['size']})", value="\n".join(lines), inline=False)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---------- แอดมิน: จัดการช่อง ----------
@@ -430,6 +544,60 @@ class Inventory(commands.Cog):
         await db.require_character(self.pool, interaction.guild_id, member.id)
         await self._place_flow(interaction, member, item, slot, announce="🎁 {user} ได้รับ **{item}** ใส่ **{slot}**")
 
+    # ---------- ต่อสู้ ----------
+    @app_commands.command(name="attack", description="โจมตีตัวละครของสมาชิกด้วยอาวุธในกระเป๋า")
+    @app_commands.describe(weapon="อาวุธที่ใช้", target="ผู้เล่นที่จะโจมตี")
+    @app_commands.autocomplete(weapon=held_ac)
+    @app_commands.guild_only()
+    async def attack(self, interaction: discord.Interaction, weapon: str, target: discord.Member):
+        r = await db.attack(self.pool, interaction.guild_id, interaction.user.id, target.id, weapon)
+        lines = [
+            f"⚔️ **{r['attacker']['name']}** โจมตี {target.mention} (**{r['target']['name']}**) ด้วย **{r['item']['name']}** — ดาเมจ **{r['damage']}**",
+            f"❤️ HP {r['hp']}/{r['max_hp']}" + (f"  |  🔫 กระสุน {r['loaded']}/{r['mag_size']}" if r["loaded"] is not None else ""),
+        ]
+        if r["downed"]:
+            lines.append(f"💀 **{r['target']['name']}** ล้มแล้ว!")
+        await interaction.response.send_message("\n".join(lines))
+
+    @app_commands.command(name="reload", description="เติมกระสุนเข้าอาวุธจากไอเท็มกระสุนในกระเป๋า")
+    @app_commands.autocomplete(weapon=held_ac)
+    @app_commands.guild_only()
+    async def reload(self, interaction: discord.Interaction, weapon: str):
+        await db.require_character(self.pool, interaction.guild_id, interaction.user.id)
+        r = await db.reload(self.pool, interaction.guild_id, interaction.user.id, weapon)
+        await interaction.response.send_message(
+            f"🔫 {interaction.user.mention} บรรจุ **{r['item']['name']}** +{r['added']} นัด ({r['loaded']}/{r['mag_size']}) ใช้ {r['ammo_name']} {r['added']} ชิ้น"
+        )
+
+    @app_commands.command(name="hp", description="ดู HP ของตัวละคร")
+    @app_commands.guild_only()
+    async def hp(self, interaction: discord.Interaction, member: discord.Member | None = None):
+        target = member or interaction.user
+        char = await db.require_character(self.pool, interaction.guild_id, target.id)
+        await interaction.response.send_message(f"❤️ **{char['name']}** HP {char['hp']}/{char['max_hp']}")
+
+    @app_commands.command(name="hp-set", description="[แอดมิน] ตั้ง HP ของตัวละคร (ใส่ max_hp เพื่อเปลี่ยน HP สูงสุดด้วย)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def hp_set(
+        self,
+        interaction: discord.Interaction,
+        member: discord.Member,
+        hp: app_commands.Range[int, 0, 1000000],
+        max_hp: app_commands.Range[int, 1, 1000000] | None = None,
+    ):
+        char = await db.set_hp(self.pool, interaction.guild_id, member.id, hp, max_hp)
+        await interaction.response.send_message(f"❤️ **{char['name']}** HP {char['hp']}/{char['max_hp']}")
+
+    @app_commands.command(name="hp-default", description="[แอดมิน] ตั้ง HP เริ่มต้นของตัวละครที่สร้างใหม่ (ไม่กระทบตัวละครเดิม)")
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
+    @admin_only
+    async def hp_default(self, interaction: discord.Interaction, value: app_commands.Range[int, 1, 1000000]):
+        await db.set_default_hp(self.pool, interaction.guild_id, value)
+        await interaction.response.send_message(f"✅ ตัวละครที่สร้างใหม่จะเริ่มที่ HP {value}", ephemeral=True)
+
     # ---------- กระเป๋า ----------
     @app_commands.command(name="inventory", description="ดูกระเป๋าของคุณ (แอดมินดูของคนอื่นได้)")
     @app_commands.guild_only()
@@ -439,13 +607,20 @@ class Inventory(commands.Cog):
             raise app_commands.MissingPermissions(["manage_guild"])
         char = await db.require_character(self.pool, interaction.guild_id, target.id)
         slots, entries = await db.inventory(self.pool, interaction.guild_id, target.id)
-        embed = discord.Embed(title=f"🎒 กระเป๋าของ {char['name']}", color=discord.Color.gold())
+        embed = discord.Embed(
+            title=f"🎒 กระเป๋าของ {char['name']}",
+            description=f"❤️ HP {char['hp']}/{char['max_hp']}",
+            color=discord.Color.gold(),
+        )
         for s in slots:
             held = [e for e in entries if e["slot_key"] == s["key"]]
             used = sum(e["size"] for e in held)
             embed.add_field(
                 name=f"{s['label']} ({used}/{s['capacity']})",
-                value="\n".join(f"• {e['name']}" for e in held) or "—",
+                value="\n".join(
+                    f"• {e['name']}" + (f"  🔫 {e['loaded']}/{e['mag_size']}" if e["mag_size"] else "") for e in held
+                )
+                or "—",
                 inline=False,
             )
         await interaction.response.send_message(embed=embed, ephemeral=target.id == interaction.user.id)

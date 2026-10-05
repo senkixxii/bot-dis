@@ -73,3 +73,15 @@ create table if not exists guild_settings (
 
 alter table characters     enable row level security;
 alter table guild_settings enable row level security;
+
+-- ระบบโจมตี: ดาเมจ/กระสุน/HP (เพิ่มคอลัมน์ รันซ้ำได้ ไม่ทับข้อมูลเดิม)
+alter table items add column if not exists damage_min int check (damage_min >= 0);
+alter table items add column if not exists damage_max int check (damage_max >= 0);
+alter table items add column if not exists ammo_item_id bigint references items (id) on delete restrict;
+alter table items add column if not exists mag_size int check (mag_size > 0);
+alter table items add column if not exists ammo_per_attack int check (ammo_per_attack > 0);
+alter table items add column if not exists attack_slots text[] not null default '{}';
+alter table inventory_entries add column if not exists loaded int not null default 0 check (loaded >= 0);
+alter table characters add column if not exists hp int not null default 100 check (hp >= 0);
+alter table characters add column if not exists max_hp int not null default 100 check (max_hp > 0);
+alter table guild_settings add column if not exists default_hp int not null default 100 check (default_hp > 0);

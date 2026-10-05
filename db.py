@@ -1,3 +1,4 @@
+import random
 from pathlib import Path
 
 import asyncpg
@@ -106,16 +107,90 @@ async def reset_slots(pool, guild_id: int):
         return len(extra)
 
 
-async def create_item(pool, guild_id: int, name: str, description: str, allowed_slots: list[str], size: int, created_by: int):
+async def build_weapon(conn, guild_id: int, w: dict, allowed_slots: list[str] | None = None, self_id: int | None = None) -> dict:
+    """ตรวจและแปลงค่าอาวุธเป็นคอลัมน์ของตาราง items
+    w: damage, damage_max, ammo_item (ชื่อ), mag_size, ammo_per_attack, attack_slots"""
+    damage = w.get("damage")
+    if damage is None:
+        raise InventoryError("ต้องระบุ damage (ดาเมจต่ำสุด)")
+    damage_max = w.get("damage_max")
+    damage_max = damage if damage_max is None else damage_max
+    if damage_max < damage:
+        raise InventoryError("ดาเมจสูงสุดต้องไม่ต่ำกว่าดาเมจต่ำสุด")
+    ammo_id = mag_size = per_attack = None
+    if w.get("ammo_item"):
+        ammo = await get_item(conn, guild_id, w["ammo_item"])
+        if ammo["id"] == self_id:
+            raise InventoryError("ใช้ไอเท็มตัวเองเป็นกระสุนไม่ได้")
+        mag_size = w.get("mag_size")
+        if mag_size is None:
+            raise InventoryError("เมื่อกำหนดกระสุน ต้องระบุ mag_size (แม็กจุกระสุนกี่นัด)")
+        per_attack = w.get("ammo_per_attack") or 1
+        if per_attack > mag_size:
+            raise InventoryError("ใช้กระสุนต่อการโจมตีมากกว่าความจุแม็กไม่ได้")
+        ammo_id = ammo["id"]
+    elif w.get("mag_size") is not None or w.get("ammo_per_attack") is not None:
+        raise InventoryError("ระบุ mag_size/ammo_per_attack แล้วต้องระบุ ammo_item (ไอเท็มที่เป็นกระสุน) ด้วย")
+    attack_slots = list(w.get("attack_slots") or [])
+    if allowed_slots is not None and not set(attack_slots) <= set(allowed_slots):
+        raise InventoryError("ช่องที่ใช้โจมตีต้องเป็นช่องที่ไอเท็มนี้ใส่ได้")
+    return {
+        "damage_min": damage, "damage_max": damage_max, "ammo_item_id": ammo_id,
+        "mag_size": mag_size, "ammo_per_attack": per_attack, "attack_slots": attack_slots,
+    }
+
+
+async def check_weapon_args(pool, guild_id: int, w: dict, allowed_slots: list[str] | None = None):
+    """ตรวจค่าอาวุธล่วงหน้า (ก่อนแสดงเมนูเลือกช่อง) ไม่แก้ฐานข้อมูล"""
     async with pool.acquire() as conn:
+        await build_weapon(conn, guild_id, w, allowed_slots)
+
+
+_NO_WEAPON = {"damage_min": None, "damage_max": None, "ammo_item_id": None, "mag_size": None,
+              "ammo_per_attack": None, "attack_slots": []}
+
+
+async def create_item(pool, guild_id: int, name: str, description: str, allowed_slots: list[str], size: int, created_by: int, weapon: dict | None = None):
+    async with pool.acquire() as conn:
+        cols = await build_weapon(conn, guild_id, weapon, allowed_slots) if weapon else _NO_WEAPON
         try:
             return await conn.fetchrow(
-                """insert into items (guild_id, name, description, allowed_slots, size, created_by)
-                   values ($1, $2, $3, $4, $5, $6) returning *""",
+                """insert into items (guild_id, name, description, allowed_slots, size, created_by,
+                       damage_min, damage_max, ammo_item_id, mag_size, ammo_per_attack, attack_slots)
+                   values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) returning *""",
                 guild_id, name, description, allowed_slots, size, created_by,
+                cols["damage_min"], cols["damage_max"], cols["ammo_item_id"], cols["mag_size"],
+                cols["ammo_per_attack"], cols["attack_slots"],
             )
         except asyncpg.UniqueViolationError:
             raise InventoryError(f"มีไอเท็มชื่อ **{name}** อยู่แล้ว") from None
+
+
+async def _apply_weapon(conn, item_id: int, cols: dict):
+    row = await conn.fetchrow(
+        """update items set damage_min = $2, damage_max = $3, ammo_item_id = $4, mag_size = $5,
+               ammo_per_attack = $6, attack_slots = $7 where id = $1 returning *""",
+        item_id, cols["damage_min"], cols["damage_max"], cols["ammo_item_id"], cols["mag_size"],
+        cols["ammo_per_attack"], cols["attack_slots"],
+    )
+    # กระสุนที่บรรจุอยู่ต้องไม่เกินแม็กใหม่ (ไม่มีกระสุน = 0)
+    await conn.execute(
+        "update inventory_entries set loaded = least(loaded, coalesce($2, 0)) where item_id = $1", item_id, cols["mag_size"]
+    )
+    return row
+
+
+async def set_weapon(pool, guild_id: int, item_name: str, w: dict):
+    async with pool.acquire() as conn, conn.transaction():
+        item = await get_item(conn, guild_id, item_name)
+        cols = await build_weapon(conn, guild_id, w, item["allowed_slots"], self_id=item["id"])
+        return await _apply_weapon(conn, item["id"], cols)
+
+
+async def clear_weapon(pool, guild_id: int, item_name: str):
+    async with pool.acquire() as conn, conn.transaction():
+        item = await get_item(conn, guild_id, item_name)
+        return await _apply_weapon(conn, item["id"], _NO_WEAPON)
 
 
 async def get_item(conn, guild_id: int, name: str):
@@ -132,7 +207,11 @@ async def find_item(pool, guild_id: int, name: str):
 
 async def list_items(pool, guild_id: int):
     async with pool.acquire() as conn:
-        return await conn.fetch("select * from items where guild_id = $1 order by name", guild_id)
+        return await conn.fetch(
+            """select i.*, a.name as ammo_name from items i left join items a on a.id = i.ammo_item_id
+               where i.guild_id = $1 order by i.name""",
+            guild_id,
+        )
 
 
 async def update_item(pool, guild_id: int, name: str, new_name=None, description=None, size=None, allowed_slots=None):
@@ -156,6 +235,11 @@ async def delete_item(pool, guild_id: int, name: str) -> int:
     """ลบไอเท็ม คืนจำนวนชิ้นที่ผู้เล่นถืออยู่ซึ่งถูกลบไปด้วย"""
     async with pool.acquire() as conn, conn.transaction():
         item = await get_item(conn, guild_id, name)
+        users = await conn.fetch("select name from items where ammo_item_id = $1 order by name", item["id"])
+        if users:
+            raise InventoryError(
+                f"**{item['name']}** เป็นกระสุนของ: {', '.join(r['name'] for r in users)} — แก้หรือลบอาวุธเหล่านั้นก่อน"
+            )
         held = await conn.fetchval("select count(*) from inventory_entries where item_id = $1", item["id"])
         await conn.execute("delete from items where id = $1", item["id"])
         return held
@@ -255,7 +339,7 @@ async def inventory(pool, guild_id: int, user_id: int):
     slots = await list_slots(pool, guild_id)
     async with pool.acquire() as conn:
         entries = await conn.fetch(
-            """select e.slot_key, i.name, i.size from inventory_entries e join items i on i.id = e.item_id
+            """select e.slot_key, e.loaded, i.name, i.size, i.mag_size from inventory_entries e join items i on i.id = e.item_id
                where e.guild_id = $1 and e.user_id = $2 order by e.id""",
             guild_id, user_id,
         )
@@ -370,8 +454,10 @@ async def create_character(pool, guild_id: int, user_id: int, name: str):
         if existing:
             raise InventoryError(f"คุณมีตัวละครแล้ว: **{existing}**")
         try:
+            hp = await conn.fetchval("select default_hp from guild_settings where guild_id = $1", guild_id) or 100
             await conn.execute(
-                "insert into characters (guild_id, user_id, name) values ($1, $2, $3)", guild_id, user_id, name
+                "insert into characters (guild_id, user_id, name, hp, max_hp) values ($1, $2, $3, $4, $4)",
+                guild_id, user_id, name, hp,
             )
         except asyncpg.UniqueViolationError:
             raise InventoryError(f"มีตัวละครชื่อ **{name}** อยู่แล้ว") from None
@@ -404,3 +490,117 @@ async def set_player_role(pool, guild_id: int, role_id: int | None):
                on conflict (guild_id) do update set player_role_id = excluded.player_role_id""",
             guild_id, role_id,
         )
+
+
+# ---------- HP / โจมตี ----------
+async def set_default_hp(pool, guild_id: int, value: int):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """insert into guild_settings (guild_id, default_hp) values ($1, $2)
+               on conflict (guild_id) do update set default_hp = excluded.default_hp""",
+            guild_id, value,
+        )
+
+
+async def set_hp(pool, guild_id: int, user_id: int, hp: int, max_hp: int | None = None):
+    """ตั้ง HP (และ HP สูงสุดถ้าระบุ) HP จะไม่เกิน HP สูงสุด"""
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_owner(conn, guild_id, user_id)
+        char = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, user_id)
+        if char is None:
+            raise InventoryError("ผู้เล่นคนนี้ยังไม่มีตัวละคร")
+        new_max = max_hp or char["max_hp"]
+        return await conn.fetchrow(
+            "update characters set hp = $3, max_hp = $4 where guild_id = $1 and user_id = $2 returning *",
+            guild_id, user_id, min(hp, new_max), new_max,
+        )
+
+
+async def attack(pool, guild_id: int, attacker_id: int, target_id: int, weapon_name: str) -> dict:
+    if attacker_id == target_id:
+        raise InventoryError("โจมตีตัวเองไม่ได้")
+    async with pool.acquire() as conn, conn.transaction():
+        for uid in sorted((attacker_id, target_id)):  # ล็อกเรียงลำดับเดียวกันเสมอ กัน deadlock
+            await _lock_owner(conn, guild_id, uid)
+        me = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, attacker_id)
+        if me is None:
+            raise InventoryError("ต้องสร้างตัวละครก่อน ใช้ `/character-create`")
+        target = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, target_id)
+        if target is None:
+            raise InventoryError("เป้าหมายยังไม่มีตัวละคร")
+        if me["hp"] <= 0:
+            raise InventoryError(f"**{me['name']}** ล้มแล้ว (HP 0) โจมตีไม่ได้")
+        if target["hp"] <= 0:
+            raise InventoryError(f"**{target['name']}** ล้มแล้ว (HP 0)")
+
+        item = await get_item(conn, guild_id, weapon_name)
+        if item["damage_min"] is None:
+            raise InventoryError(f"**{item['name']}** ใช้โจมตีไม่ได้")
+        entries = await conn.fetch(
+            "select * from inventory_entries where guild_id = $1 and user_id = $2 and item_id = $3 order by loaded desc, id",
+            guild_id, attacker_id, item["id"],
+        )
+        if not entries:
+            raise InventoryError(f"คุณไม่ได้ถือ **{item['name']}**")
+        if item["attack_slots"]:
+            entries = [e for e in entries if e["slot_key"] in item["attack_slots"]]
+            if not entries:
+                labels = await conn.fetch(
+                    "select label from slots where guild_id = $1 and key = any($2::text[]) order by key",
+                    guild_id, item["attack_slots"],
+                )
+                raise InventoryError(
+                    f"ต้องถือ **{item['name']}** ในช่อง {', '.join(r['label'] for r in labels)} ถึงจะโจมตีได้"
+                )
+        entry, loaded_left = entries[0], None
+        if item["ammo_item_id"] is not None:
+            need = item["ammo_per_attack"]
+            entry = next((e for e in entries if e["loaded"] >= need), None)
+            if entry is None:
+                best = entries[0]["loaded"]
+                raise InventoryError(
+                    f"กระสุนไม่พอ (**{item['name']}** มี {best}/{item['mag_size']} ต้องใช้ {need} นัด) ใช้ `/reload`"
+                )
+            loaded_left = entry["loaded"] - need
+            await conn.execute("update inventory_entries set loaded = $2 where id = $1", entry["id"], loaded_left)
+
+        damage = random.randint(item["damage_min"], item["damage_max"])
+        new_hp = max(0, target["hp"] - damage)
+        await conn.execute(
+            "update characters set hp = $3 where guild_id = $1 and user_id = $2", guild_id, target_id, new_hp
+        )
+        return {
+            "item": item, "attacker": me, "target": target, "damage": damage, "hp": new_hp,
+            "max_hp": target["max_hp"], "loaded": loaded_left, "mag_size": item["mag_size"], "downed": new_hp == 0,
+        }
+
+
+async def reload(pool, guild_id: int, user_id: int, weapon_name: str) -> dict:
+    """เติมแม็กอาวุธจากไอเท็มกระสุนในกระเป๋า (กระสุน 1 ชิ้น = 1 นัด)"""
+    async with pool.acquire() as conn, conn.transaction():
+        await _lock_owner(conn, guild_id, user_id)
+        item = await get_item(conn, guild_id, weapon_name)
+        if item["ammo_item_id"] is None:
+            raise InventoryError(f"**{item['name']}** ไม่ต้องบรรจุกระสุน")
+        entries = await conn.fetch(
+            "select * from inventory_entries where guild_id = $1 and user_id = $2 and item_id = $3 order by loaded, id",
+            guild_id, user_id, item["id"],
+        )
+        if not entries:
+            raise InventoryError(f"คุณไม่ได้ถือ **{item['name']}**")
+        entry = entries[0]
+        space = item["mag_size"] - entry["loaded"]
+        if space <= 0:
+            raise InventoryError(f"แม็กของ **{item['name']}** เต็มแล้ว ({entry['loaded']}/{item['mag_size']})")
+        ammo_name = await conn.fetchval("select name from items where id = $1", item["ammo_item_id"])
+        rows = await conn.fetch(
+            """select id from inventory_entries where guild_id = $1 and user_id = $2 and item_id = $3
+               order by id limit $4 for update""",
+            guild_id, user_id, item["ammo_item_id"], space,
+        )
+        if not rows:
+            raise InventoryError(f"ไม่มีกระสุน **{ammo_name}** ในกระเป๋า")
+        await conn.execute("delete from inventory_entries where id = any($1::bigint[])", [r["id"] for r in rows])
+        loaded = entry["loaded"] + len(rows)
+        await conn.execute("update inventory_entries set loaded = $2 where id = $1", entry["id"], loaded)
+        return {"item": item, "ammo_name": ammo_name, "added": len(rows), "loaded": loaded, "mag_size": item["mag_size"]}
