@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 
 import discord
@@ -80,6 +81,45 @@ def fmt_starter_note(granted, skipped) -> str | None:
         lines.append("🎁 ได้รับชุดเริ่มต้น: " + ", ".join(f"{name} → {label}" for name, label in granted))
     lines += [f"⚠️ {msg}" for msg in skipped]
     return "\n".join(lines)
+
+
+def _pct(hp: int, max_hp: int) -> float:
+    return hp / max_hp if max_hp > 0 else 0.0
+
+
+def hp_bar(hp: int, max_hp: int, width: int = 10) -> str:
+    """หลอด HP แบบบล็อกอีโมจิ: เขียว ≥60% เหลือง ≥30% แดง <30% (ยังมีชีวิตอย่างน้อย 1 บล็อก)"""
+    pct = _pct(hp, max_hp)
+    filled = 0 if hp <= 0 else min(width, max(1, math.ceil(width * pct)))
+    color = "🟩" if pct >= 0.6 else "🟨" if pct >= 0.3 else "🟥"
+    return color * filled + "⬜" * (width - filled)
+
+
+def hp_color(hp: int, max_hp: int) -> discord.Color:
+    pct = _pct(hp, max_hp)
+    if hp <= 0:
+        return discord.Color(0x95A5A6)
+    return discord.Color(0x2ECC71 if pct >= 0.6 else 0xF1C40F if pct >= 0.3 else 0xE74C3C)
+
+
+def hp_text(hp: int, max_hp: int) -> str:
+    text = f"{hp_bar(hp, max_hp)} **{hp}/{max_hp}**"
+    return f"💀 ล้มแล้ว\n{text}" if hp <= 0 else text
+
+
+def ammo_bar(loaded: int, mag_size: int) -> str:
+    width = max(1, min(mag_size, 10))
+    filled = 0 if loaded <= 0 else min(width, max(1, math.ceil(width * loaded / mag_size)))
+    return "🟦" * filled + "⬜" * (width - filled)
+
+
+def weapon_status(entry, labels: dict) -> str:
+    """สถานะของอาวุธชิ้นหนึ่งในกระเป๋า: พร้อมโจมตีหรือไม่ เพราะอะไร"""
+    if entry["attack_slots"] and entry["slot_key"] not in entry["attack_slots"]:
+        return "⚠️ ต้องถือใน " + ", ".join(labels.get(k, k) for k in entry["attack_slots"])
+    if entry["ammo_item_id"] is not None and entry["loaded"] < entry["ammo_per_attack"]:
+        return "🔴 กระสุนไม่พอ ใช้ /reload"
+    return "✅ พร้อมโจมตี"
 
 
 def fmt_weapon(item, ammo_name: str | None = None, labels: dict | None = None) -> str | None:
@@ -551,13 +591,18 @@ class Inventory(commands.Cog):
     @app_commands.guild_only()
     async def attack(self, interaction: discord.Interaction, weapon: str, target: discord.Member):
         r = await db.attack(self.pool, interaction.guild_id, interaction.user.id, target.id, weapon)
+        # ประกาศในห้องโดยไม่บอก HP เป้าหมาย (ผู้เล่นดู HP ตัวเองได้ด้วย /status)
         lines = [
             f"⚔️ **{r['attacker']['name']}** โจมตี {target.mention} (**{r['target']['name']}**) ด้วย **{r['item']['name']}** — ดาเมจ **{r['damage']}**",
-            f"❤️ HP {r['hp']}/{r['max_hp']}" + (f"  |  🔫 กระสุน {r['loaded']}/{r['mag_size']}" if r["loaded"] is not None else ""),
         ]
         if r["downed"]:
             lines.append(f"💀 **{r['target']['name']}** ล้มแล้ว!")
         await interaction.response.send_message("\n".join(lines))
+        if r["loaded"] is not None:  # กระสุนที่เหลือ บอกเฉพาะผู้โจมตี
+            await interaction.followup.send(
+                f"🔫 **{r['item']['name']}** เหลือกระสุน {ammo_bar(r['loaded'], r['mag_size'])} {r['loaded']}/{r['mag_size']}",
+                ephemeral=True,
+            )
 
     @app_commands.command(name="reload", description="เติมกระสุนเข้าอาวุธจากไอเท็มกระสุนในกระเป๋า")
     @app_commands.autocomplete(weapon=held_ac)
@@ -569,12 +614,14 @@ class Inventory(commands.Cog):
             f"🔫 {interaction.user.mention} บรรจุ **{r['item']['name']}** +{r['added']} นัด ({r['loaded']}/{r['mag_size']}) ใช้ {r['ammo_name']} {r['added']} ชิ้น"
         )
 
-    @app_commands.command(name="hp", description="ดู HP ของตัวละคร")
+    @app_commands.command(name="hp", description="ดู HP ของตัวละครคุณ (แอดมินดูของคนอื่นได้)")
     @app_commands.guild_only()
     async def hp(self, interaction: discord.Interaction, member: discord.Member | None = None):
         target = member or interaction.user
+        if target.id != interaction.user.id and not interaction.permissions.manage_guild:
+            raise app_commands.MissingPermissions(["manage_guild"])
         char = await db.require_character(self.pool, interaction.guild_id, target.id)
-        await interaction.response.send_message(f"❤️ **{char['name']}** HP {char['hp']}/{char['max_hp']}")
+        await interaction.response.send_message(f"❤️ **{char['name']}**\n{hp_text(char['hp'], char['max_hp'])}", ephemeral=True)
 
     @app_commands.command(name="hp-set", description="[แอดมิน] ตั้ง HP ของตัวละคร (ใส่ max_hp เพื่อเปลี่ยน HP สูงสุดด้วย)")
     @app_commands.guild_only()
@@ -588,7 +635,7 @@ class Inventory(commands.Cog):
         max_hp: app_commands.Range[int, 1, 1000000] | None = None,
     ):
         char = await db.set_hp(self.pool, interaction.guild_id, member.id, hp, max_hp)
-        await interaction.response.send_message(f"❤️ **{char['name']}** HP {char['hp']}/{char['max_hp']}")
+        await interaction.response.send_message(f"❤️ **{char['name']}**\n{hp_text(char['hp'], char['max_hp'])}", ephemeral=True)
 
     @app_commands.command(name="hp-default", description="[แอดมิน] ตั้ง HP เริ่มต้นของตัวละครที่สร้างใหม่ (ไม่กระทบตัวละครเดิม)")
     @app_commands.guild_only()
@@ -599,31 +646,44 @@ class Inventory(commands.Cog):
         await interaction.response.send_message(f"✅ ตัวละครที่สร้างใหม่จะเริ่มที่ HP {value}", ephemeral=True)
 
     # ---------- กระเป๋า ----------
-    @app_commands.command(name="inventory", description="ดูกระเป๋าของคุณ (แอดมินดูของคนอื่นได้)")
+    @app_commands.command(name="status", description="ดูข้อมูลตัวละคร: หลอด HP ช่องกระเป๋า และกระสุน (เห็นคนเดียว)")
+    @app_commands.describe(member="(แอดมิน) ผู้เล่นที่จะดู — ไม่ใส่ = ตัวคุณเอง")
     @app_commands.guild_only()
-    async def inventory(self, interaction: discord.Interaction, member: discord.Member | None = None):
+    async def status(self, interaction: discord.Interaction, member: discord.Member | None = None):
         target = member or interaction.user
         if target.id != interaction.user.id and not interaction.permissions.manage_guild:
             raise app_commands.MissingPermissions(["manage_guild"])
         char = await db.require_character(self.pool, interaction.guild_id, target.id)
         slots, entries = await db.inventory(self.pool, interaction.guild_id, target.id)
-        embed = discord.Embed(
-            title=f"🎒 กระเป๋าของ {char['name']}",
-            description=f"❤️ HP {char['hp']}/{char['max_hp']}",
-            color=discord.Color.gold(),
-        )
+        labels = {s["key"]: s["label"] for s in slots}
+
+        embed = discord.Embed(title=f"🧑 {char['name']}", color=hp_color(char["hp"], char["max_hp"]))
+        embed.set_thumbnail(url=target.display_avatar.url)
+        embed.add_field(name="❤️ HP", value=hp_text(char["hp"], char["max_hp"]), inline=False)
+
+        weapons = [e for e in entries if e["damage_min"] is not None]
+        if weapons:
+            lines = []
+            for e in weapons:
+                dmg = str(e["damage_min"]) if e["damage_min"] == e["damage_max"] else f"{e['damage_min']}-{e['damage_max']}"
+                line = f"**{e['name']}** — {labels.get(e['slot_key'], e['slot_key'])} · ⚔️ {dmg}"
+                if e["ammo_item_id"] is not None:
+                    line += f"\n{ammo_bar(e['loaded'], e['mag_size'])} {e['loaded']}/{e['mag_size']}"
+                lines.append(f"{line}\n{weapon_status(e, labels)}")
+            embed.add_field(name="🔫 อาวุธ", value="\n\n".join(lines)[:1024], inline=False)
+
         for s in slots:
             held = [e for e in entries if e["slot_key"] == s["key"]]
             used = sum(e["size"] for e in held)
             embed.add_field(
-                name=f"{s['label']} ({used}/{s['capacity']})",
+                name=f"🎒 {s['label']} ({used}/{s['capacity']})",
                 value="\n".join(
                     f"• {e['name']}" + (f"  🔫 {e['loaded']}/{e['mag_size']}" if e["mag_size"] else "") for e in held
-                )
+                )[:1024]
                 or "—",
                 inline=False,
             )
-        await interaction.response.send_message(embed=embed, ephemeral=target.id == interaction.user.id)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="move", description="ย้ายไอเท็มไปช่องอื่น")
     @app_commands.autocomplete(item=held_ac, to_slot=slot_ac)

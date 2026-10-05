@@ -339,7 +339,9 @@ async def inventory(pool, guild_id: int, user_id: int):
     slots = await list_slots(pool, guild_id)
     async with pool.acquire() as conn:
         entries = await conn.fetch(
-            """select e.slot_key, e.loaded, i.name, i.size, i.mag_size from inventory_entries e join items i on i.id = e.item_id
+            """select e.slot_key, e.loaded, i.name, i.size, i.mag_size, i.damage_min, i.damage_max,
+                      i.ammo_per_attack, i.ammo_item_id, i.attack_slots
+               from inventory_entries e join items i on i.id = e.item_id
                where e.guild_id = $1 and e.user_id = $2 order by e.id""",
             guild_id, user_id,
         )

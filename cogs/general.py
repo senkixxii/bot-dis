@@ -7,7 +7,7 @@ from discord.ext import commands
 HELP_CATEGORIES = [
     ("🧑 ตัวละคร", ["character-create"], False),
     ("⚔️ ต่อสู้", ["attack", "reload", "hp"], False),
-    ("🎒 กระเป๋า", ["inventory", "pickup", "move", "drop", "item-list", "slot-list", "starter-list"], False),
+    ("🎒 กระเป๋า", ["status", "pickup", "move", "drop", "item-list", "slot-list", "starter-list"], False),
     ("🎮 ทั่วไป", ["help", "ping", "hello", "userinfo", "choose"], False),
     ("🛡️ แอดมิน: ไอเท็มและช่อง", ["item-create", "item-edit", "item-weapon", "item-delete", "slot-set", "slot-delete", "slot-reset"], True),
     (
