@@ -85,3 +85,15 @@ alter table inventory_entries add column if not exists loaded int not null defau
 alter table characters add column if not exists hp int not null default 100 check (hp >= 0);
 alter table characters add column if not exists max_hp int not null default 100 check (max_hp > 0);
 alter table guild_settings add column if not exists default_hp int not null default 100 check (default_hp > 0);
+
+-- ศพ: ตัวละครที่ HP หมด ของบนศพคือแถวใน inventory_entries ที่ user_id = -corpses.id
+create table if not exists corpses (
+    id        bigserial primary key,
+    guild_id  bigint      not null,
+    user_id   bigint      not null,
+    name      text        not null,
+    killed_by text,
+    died_at   timestamptz not null default now()
+);
+create index if not exists corpses_guild_idx on corpses (guild_id, died_at desc);
+alter table corpses enable row level security;

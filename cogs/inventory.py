@@ -179,6 +179,22 @@ class Inventory(commands.Cog):
         names = sorted({e["name"] for e in entries})
         return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
 
+    async def corpse_ac(self, interaction: discord.Interaction, current: str):
+        rows = await db.list_corpses(self.pool, interaction.guild_id)
+        return [
+            app_commands.Choice(name=f"{r['name']} (ศพ #{r['id']} · {r['items']} ชิ้น)"[:100], value=str(r["id"]))
+            for r in rows
+            if current.lower() in r["name"].lower()
+        ][:25]
+
+    async def corpse_item_ac(self, interaction: discord.Interaction, current: str):
+        try:
+            items = await db.corpse_items(self.pool, interaction.guild_id, int(interaction.namespace.corpse))
+        except (ValueError, TypeError, db.InventoryError):
+            return []
+        names = sorted({e["name"] for e in items})
+        return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
     # ---------- แอดมิน: จัดการไอเท็ม ----------
     @app_commands.command(name="item-create", description="[แอดมิน] สร้างไอเท็มใหม่ (ใส่ damage = เป็นอาวุธ)")
     @app_commands.describe(
@@ -532,12 +548,20 @@ class Inventory(commands.Cog):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ---------- เก็บ/แจก ----------
-    async def _place_flow(self, interaction: discord.Interaction, target: discord.Member, item_name: str, slot: str | None, *, announce: str):
+    async def _place_flow(
+        self, interaction: discord.Interaction, target: discord.Member, item_name: str, slot: str | None, *, announce: str, place=None
+    ):
+        """ใส่ไอเท็มเข้ากระเป๋า target — place(key) -> (_, slot) ใช้แทน db.place ได้ (เช่นตอนลูทศพ)"""
         gid = interaction.guild_id
         item = await db.find_item(self.pool, gid, item_name)
 
+        async def put(key: str):
+            if place:
+                return await place(key)
+            return await db.place(self.pool, gid, target.id, item["name"], key)
+
         async def do_place(i: discord.Interaction, key: str):
-            _, s = await db.place(self.pool, gid, target.id, item["name"], key)
+            _, s = await put(key)
             text = announce.format(item=item["name"], slot=s["label"], user=target.mention)
             if i.response.is_done():
                 await i.followup.send(text)
@@ -557,7 +581,7 @@ class Inventory(commands.Cog):
 
         async def on_pick(i: discord.Interaction, keys: list[str]):
             try:
-                _, s = await db.place(self.pool, gid, target.id, item["name"], keys[0])
+                _, s = await put(keys[0])
             except db.InventoryError as e:
                 await i.response.edit_message(content=str(e), view=None)
                 return
@@ -584,6 +608,57 @@ class Inventory(commands.Cog):
         await db.require_character(self.pool, interaction.guild_id, member.id)
         await self._place_flow(interaction, member, item, slot, announce="🎁 {user} ได้รับ **{item}** ใส่ **{slot}**")
 
+    @app_commands.command(name="loot", description="เก็บของจากศพเข้ากระเป๋า (ไม่ใส่ item = ดูของบนศพ)")
+    @app_commands.describe(corpse="ศพที่เจอ", item="ของที่จะเก็บ (ไม่ใส่ = ดูว่ามีอะไรบ้าง)", slot="ช่องที่จะใส่ (ไม่ใส่ = ให้เลือก)")
+    @app_commands.autocomplete(corpse=corpse_ac, item=corpse_item_ac, slot=slot_ac)
+    @app_commands.guild_only()
+    async def loot(self, interaction: discord.Interaction, corpse: str, item: str | None = None, slot: str | None = None):
+        gid = interaction.guild_id
+        await db.require_character(self.pool, gid, interaction.user.id)
+        try:
+            corpse_id = int(corpse)
+        except ValueError:
+            raise db.InventoryError("เลือกศพจากรายการที่ขึ้นให้") from None
+        body = await db.get_corpse(self.pool, gid, corpse_id)
+        items = await db.corpse_items(self.pool, gid, corpse_id)
+        if item is None:
+            if not items:
+                await interaction.response.send_message(f"🪦 ศพของ **{body['name']}** ไม่มีของแล้ว", ephemeral=True)
+                return
+            lines, seen = [], {}
+            for e in items:
+                seen[e["name"]] = seen.get(e["name"], 0) + 1
+            for name, n in sorted(seen.items()):
+                mags = [e for e in items if e["name"] == name and e["mag_size"]]
+                extra = "  🔫 " + ", ".join(f"{e['loaded']}/{e['mag_size']}" for e in mags) if mags else ""
+                lines.append(f"• {name}" + (f" ×{n}" if n > 1 else "") + extra)
+            await interaction.response.send_message(f"🪦 **ศพของ {body['name']}**\n" + "\n".join(lines), ephemeral=True)
+            return
+        if not any(e["name"].lower() == item.lower() for e in items):
+            raise db.InventoryError(f"ศพของ **{body['name']}** ไม่มี **{item}**")
+
+        async def place(key: str):
+            _, it, s = await db.loot(self.pool, gid, interaction.user.id, corpse_id, item, key)
+            return it, s
+
+        name = body["name"].replace("{", "{{").replace("}", "}}")
+        await self._place_flow(
+            interaction, interaction.user, item, slot, place=place,
+            announce="🪦 {user} เก็บ **{item}** จากศพของ **" + name + "** ใส่ **{slot}**",
+        )
+
+    async def _remove_player_role(self, guild: discord.Guild | None, member: discord.Member):
+        """ถอดยศผู้เล่นตอนตัวละครตาย (ทำได้ก็ทำ ไม่ได้ก็ข้าม ไม่ให้การตายพัง)"""
+        if guild is None:
+            return
+        role_id = await db.get_player_role(self.pool, guild.id)
+        role = guild.get_role(role_id) if role_id else None
+        if role and role in member.roles:
+            try:
+                await member.remove_roles(role, reason="ตัวละครเสียชีวิต")
+            except discord.HTTPException:
+                log.warning("ถอดยศ %s จาก %s ไม่สำเร็จ", role_id, member.id)
+
     # ---------- ต่อสู้ ----------
     @app_commands.command(name="attack", description="โจมตีตัวละครของสมาชิกด้วยอาวุธในกระเป๋า")
     @app_commands.describe(weapon="อาวุธที่ใช้", target="ผู้เล่นที่จะโจมตี")
@@ -595,9 +670,12 @@ class Inventory(commands.Cog):
         lines = [
             f"⚔️ **{r['attacker']['name']}** โจมตี {target.mention} (**{r['target']['name']}**) ด้วย **{r['item']['name']}** — ดาเมจ **{r['damage']}**",
         ]
-        if r["downed"]:
-            lines.append(f"💀 **{r['target']['name']}** ล้มแล้ว!")
+        died = r["died"]
+        if died:
+            lines.append(f"💀 **{died['name']}** เสียชีวิต! ศพทิ้งของไว้ {died['items']} ชิ้น — ใช้ `/loot` เก็บได้")
         await interaction.response.send_message("\n".join(lines))
+        if died:
+            await self._remove_player_role(interaction.guild, target)
         if r["loaded"] is not None:  # กระสุนที่เหลือ บอกเฉพาะผู้โจมตี
             await interaction.followup.send(
                 f"🔫 **{r['item']['name']}** เหลือกระสุน {ammo_bar(r['loaded'], r['mag_size'])} {r['loaded']}/{r['mag_size']}",
@@ -623,7 +701,7 @@ class Inventory(commands.Cog):
         char = await db.require_character(self.pool, interaction.guild_id, target.id)
         await interaction.response.send_message(f"❤️ **{char['name']}**\n{hp_text(char['hp'], char['max_hp'])}", ephemeral=True)
 
-    @app_commands.command(name="hp-set", description="[แอดมิน] ตั้ง HP ของตัวละคร (ใส่ max_hp เพื่อเปลี่ยน HP สูงสุดด้วย)")
+    @app_commands.command(name="hp-set", description="[แอดมิน] ตั้ง HP ของตัวละคร (0 = ตายถาวร, ใส่ max_hp เพื่อเปลี่ยน HP สูงสุดด้วย)")
     @app_commands.guild_only()
     @app_commands.default_permissions(manage_guild=True)
     @admin_only
@@ -634,7 +712,26 @@ class Inventory(commands.Cog):
         hp: app_commands.Range[int, 0, 1000000],
         max_hp: app_commands.Range[int, 1, 1000000] | None = None,
     ):
-        char = await db.set_hp(self.pool, interaction.guild_id, member.id, hp, max_hp)
+        gid = interaction.guild_id
+        if hp == 0:  # HP 0 = ตายถาวร (ไม่มีคำสั่งชุบ) จึงต้องยืนยันก่อน
+            char = await db.require_character(self.pool, gid, member.id)
+            view = ConfirmView(interaction.user.id)
+            await interaction.response.send_message(
+                f"ตั้ง HP เป็น 0 = ตัวละคร **{char['name']}** ของ {member.mention} จะ **เสียชีวิตถาวร** (ไม่มีคำสั่งชุบ) ยืนยัน?",
+                view=view,
+                ephemeral=True,
+            )
+            await view.wait()
+            if not view.confirmed:
+                return
+            _, died = await db.set_hp(self.pool, gid, member.id, 0, max_hp)
+            await interaction.edit_original_response(content="💀 ดำเนินการแล้ว", view=None)
+            await interaction.followup.send(
+                f"💀 **{died['name']}** เสียชีวิต! ศพทิ้งของไว้ {died['items']} ชิ้น — ใช้ `/loot` เก็บได้"
+            )
+            await self._remove_player_role(interaction.guild, member)
+            return
+        char, _ = await db.set_hp(self.pool, gid, member.id, hp, max_hp)
         await interaction.response.send_message(f"❤️ **{char['name']}**\n{hp_text(char['hp'], char['max_hp'])}", ephemeral=True)
 
     @app_commands.command(name="hp-default", description="[แอดมิน] ตั้ง HP เริ่มต้นของตัวละครที่สร้างใหม่ (ไม่กระทบตัวละครเดิม)")

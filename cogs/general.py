@@ -11,7 +11,7 @@ log = logging.getLogger("general")
 HELP_GENERAL = [
     ("🧑 ตัวละคร", ["character-create"]),
     ("⚔️ ต่อสู้", ["attack", "reload", "hp"]),
-    ("🎒 กระเป๋า", ["status", "pickup", "move", "drop", "item-list", "slot-list", "starter-list"]),
+    ("🎒 กระเป๋า", ["status", "pickup", "loot", "move", "drop", "item-list", "slot-list", "starter-list"]),
     ("🎮 ทั่วไป", ["help", "ping", "hello", "userinfo", "choose"]),
 ]
 HELP_ADMIN = [

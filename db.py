@@ -439,11 +439,22 @@ async def get_character(pool, guild_id: int, user_id: int):
         return await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, user_id)
 
 
+async def _missing_character(conn, guild_id: int, user_id: int) -> InventoryError:
+    """ข้อความเมื่อผู้เล่นไม่มีตัวละคร: ถ้าเคยตายจะบอกว่าเสียชีวิตแล้ว"""
+    dead = await conn.fetchval(
+        "select name from corpses where guild_id = $1 and user_id = $2 order by died_at desc limit 1", guild_id, user_id
+    )
+    if dead:
+        return InventoryError(f"💀 ตัวละครของคุณ (**{dead}**) เสียชีวิตแล้ว ใช้ `/character-create` สร้างตัวละครใหม่")
+    return InventoryError("ต้องสร้างตัวละครก่อน ใช้ `/character-create`")
+
+
 async def require_character(pool, guild_id: int, user_id: int):
-    char = await get_character(pool, guild_id, user_id)
-    if char is None:
-        raise InventoryError("ต้องสร้างตัวละครก่อน ใช้ `/character-create`")
-    return char
+    async with pool.acquire() as conn:
+        char = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, user_id)
+        if char is None:
+            raise await _missing_character(conn, guild_id, user_id)
+        return char
 
 
 async def create_character(pool, guild_id: int, user_id: int, name: str):
@@ -504,18 +515,42 @@ async def set_default_hp(pool, guild_id: int, value: int):
         )
 
 
+async def _kill(conn, guild_id: int, user_id: int, killed_by: str | None = None) -> dict:
+    """ตัวละครตาย: ลบตัวละคร ย้ายของทั้งหมดไปเป็นศพ (user_id = -corpse_id) ล้างสถานะรับชุดเริ่มต้น
+    ต้องเรียกใน transaction ที่ล็อกผู้เล่นคนนั้นไว้แล้ว"""
+    name = await conn.fetchval(
+        "delete from characters where guild_id = $1 and user_id = $2 returning name", guild_id, user_id
+    )
+    corpse_id = await conn.fetchval(
+        "insert into corpses (guild_id, user_id, name, killed_by) values ($1, $2, $3, $4) returning id",
+        guild_id, user_id, name, killed_by,
+    )
+    moved = await conn.fetchval(
+        """with m as (update inventory_entries set user_id = $3 where guild_id = $1 and user_id = $2 returning 1)
+           select count(*) from m""",
+        guild_id, user_id, -corpse_id,
+    )
+    await conn.execute("delete from starter_granted where guild_id = $1 and user_id = $2", guild_id, user_id)
+    return {"corpse_id": corpse_id, "name": name, "items": moved}
+
+
 async def set_hp(pool, guild_id: int, user_id: int, hp: int, max_hp: int | None = None):
-    """ตั้ง HP (และ HP สูงสุดถ้าระบุ) HP จะไม่เกิน HP สูงสุด"""
+    """ตั้ง HP (และ HP สูงสุดถ้าระบุ) HP จะไม่เกิน HP สูงสุด
+    คืน (ตัวละคร, None) หรือ (None, ข้อมูลการตาย) ถ้า HP เหลือ 0 = ตัวละครตาย"""
     async with pool.acquire() as conn, conn.transaction():
         await _lock_owner(conn, guild_id, user_id)
         char = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, user_id)
         if char is None:
             raise InventoryError("ผู้เล่นคนนี้ยังไม่มีตัวละคร")
         new_max = max_hp or char["max_hp"]
-        return await conn.fetchrow(
+        new_hp = min(hp, new_max)
+        if new_hp <= 0:
+            return None, await _kill(conn, guild_id, user_id)
+        row = await conn.fetchrow(
             "update characters set hp = $3, max_hp = $4 where guild_id = $1 and user_id = $2 returning *",
-            guild_id, user_id, min(hp, new_max), new_max,
+            guild_id, user_id, new_hp, new_max,
         )
+        return row, None
 
 
 async def attack(pool, guild_id: int, attacker_id: int, target_id: int, weapon_name: str) -> dict:
@@ -526,7 +561,7 @@ async def attack(pool, guild_id: int, attacker_id: int, target_id: int, weapon_n
             await _lock_owner(conn, guild_id, uid)
         me = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, attacker_id)
         if me is None:
-            raise InventoryError("ต้องสร้างตัวละครก่อน ใช้ `/character-create`")
+            raise await _missing_character(conn, guild_id, attacker_id)
         target = await conn.fetchrow("select * from characters where guild_id = $1 and user_id = $2", guild_id, target_id)
         if target is None:
             raise InventoryError("เป้าหมายยังไม่มีตัวละคร")
@@ -568,12 +603,16 @@ async def attack(pool, guild_id: int, attacker_id: int, target_id: int, weapon_n
 
         damage = random.randint(item["damage_min"], item["damage_max"])
         new_hp = max(0, target["hp"] - damage)
-        await conn.execute(
-            "update characters set hp = $3 where guild_id = $1 and user_id = $2", guild_id, target_id, new_hp
-        )
+        died = None
+        if new_hp == 0:
+            died = await _kill(conn, guild_id, target_id, me["name"])
+        else:
+            await conn.execute(
+                "update characters set hp = $3 where guild_id = $1 and user_id = $2", guild_id, target_id, new_hp
+            )
         return {
             "item": item, "attacker": me, "target": target, "damage": damage, "hp": new_hp,
-            "max_hp": target["max_hp"], "loaded": loaded_left, "mag_size": item["mag_size"], "downed": new_hp == 0,
+            "max_hp": target["max_hp"], "loaded": loaded_left, "mag_size": item["mag_size"], "died": died,
         }
 
 
@@ -606,3 +645,57 @@ async def reload(pool, guild_id: int, user_id: int, weapon_name: str) -> dict:
         loaded = entry["loaded"] + len(rows)
         await conn.execute("update inventory_entries set loaded = $2 where id = $1", entry["id"], loaded)
         return {"item": item, "ammo_name": ammo_name, "added": len(rows), "loaded": loaded, "mag_size": item["mag_size"]}
+
+
+# ---------- ศพ / ลูท ----------
+async def list_corpses(pool, guild_id: int, limit: int = 25):
+    """ศพที่ยังมีของ (ล่าสุดก่อน)"""
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """select c.id, c.name, c.died_at, count(e.id) as items
+               from corpses c join inventory_entries e on e.guild_id = c.guild_id and e.user_id = -c.id
+               where c.guild_id = $1 group by c.id order by c.died_at desc limit $2""",
+            guild_id, limit,
+        )
+
+
+async def get_corpse(pool, guild_id: int, corpse_id: int):
+    async with pool.acquire() as conn:
+        corpse = await conn.fetchrow("select * from corpses where guild_id = $1 and id = $2", guild_id, corpse_id)
+    if corpse is None:
+        raise InventoryError("ไม่พบศพนี้")
+    return corpse
+
+
+async def corpse_items(pool, guild_id: int, corpse_id: int):
+    await get_corpse(pool, guild_id, corpse_id)
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """select e.slot_key, e.loaded, i.name, i.size, i.mag_size
+               from inventory_entries e join items i on i.id = e.item_id
+               where e.guild_id = $1 and e.user_id = $2 order by e.id""",
+            guild_id, -corpse_id,
+        )
+
+
+async def loot(pool, guild_id: int, looter_id: int, corpse_id: int, item_name: str, slot_key: str):
+    """เก็บของ 1 ชิ้นจากศพเข้ากระเป๋าผู้ลูท (ใช้กฎช่อง/ความจุเดิม กระสุนที่บรรจุคงอยู่)"""
+    async with pool.acquire() as conn, conn.transaction():
+        for owner in sorted((looter_id, -corpse_id)):  # ล็อกเรียงลำดับเดียวกันเสมอ กัน deadlock
+            await _lock_owner(conn, guild_id, owner)
+        corpse = await conn.fetchrow("select * from corpses where guild_id = $1 and id = $2", guild_id, corpse_id)
+        if corpse is None:
+            raise InventoryError("ไม่พบศพนี้")
+        item = await get_item(conn, guild_id, item_name)
+        entry = await conn.fetchrow(
+            """select id from inventory_entries where guild_id = $1 and user_id = $2 and item_id = $3
+               order by loaded desc, id limit 1""",
+            guild_id, -corpse_id, item["id"],
+        )
+        if entry is None:
+            raise InventoryError(f"ศพของ **{corpse['name']}** ไม่มี **{item['name']}**")
+        slot = await _check_fit(conn, guild_id, looter_id, item, slot_key)
+        await conn.execute(
+            "update inventory_entries set user_id = $2, slot_key = $3 where id = $1", entry["id"], looter_id, slot_key
+        )
+        return corpse, item, slot
